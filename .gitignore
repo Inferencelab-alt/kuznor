@@ -1,0 +1,51 @@
+# Rust build outputs
+/target/
+/target-*/
+
+# Databases
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Models
+*.gguf
+*.ggml
+
+# Logs
+*.log
+logs/
+
+# Secrets / environment
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+
+# Local runtime/cache
+data/
+runtime/
+cache/
+.cache/
+tmp/
+temp/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local release packages
+dist/
+release/
+*.zip
+*.7z
+/Kuznor-v*-windows-x64/
