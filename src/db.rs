@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use crate::{
     code::types::{CodeChunk, CodeFile, CodeProject},
@@ -21,6 +21,72 @@ fn valid_library_name(name: &str) -> Result<&str> {
     Ok(name)
 }
 
+const CURRENT_SCHEMA_VERSION: i32 = 1;
+
+const CREATE_TABLES_V1: &str = r#"
+    CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE libraries (
+        id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+    );
+    CREATE TABLE chats (
+        id INTEGER PRIMARY KEY, title TEXT NOT NULL, profile TEXT NOT NULL,
+        library_id INTEGER REFERENCES libraries(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE messages (
+        id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        role TEXT NOT NULL, content TEXT NOT NULL, sources_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE documents (
+        id INTEGER PRIMARY KEY, library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        name TEXT NOT NULL, original_path TEXT NOT NULL, hash TEXT NOT NULL,
+        file_type TEXT NOT NULL, status TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL,
+        UNIQUE(library_id, hash)
+    );
+    CREATE TABLE document_chunks (
+        id INTEGER PRIMARY KEY, document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        chunk_index INTEGER NOT NULL, content TEXT NOT NULL, page_number INTEGER,
+        section TEXT, embedding BLOB NOT NULL, UNIQUE(document_id, chunk_index)
+    );
+    CREATE TABLE code_projects (
+        id INTEGER PRIMARY KEY, name TEXT NOT NULL, root_path TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'listo', last_opened TEXT NOT NULL
+    );
+    CREATE TABLE code_files (
+        id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES code_projects(id) ON DELETE CASCADE,
+        relative_path TEXT NOT NULL, hash TEXT NOT NULL, extension TEXT NOT NULL,
+        language TEXT NOT NULL, size_bytes INTEGER NOT NULL, error TEXT,
+        indexed_at TEXT NOT NULL, UNIQUE(project_id, relative_path)
+    );
+    CREATE TABLE code_chunks (
+        id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,
+        chunk_index INTEGER NOT NULL, line_start INTEGER NOT NULL, line_end INTEGER NOT NULL,
+        content TEXT NOT NULL, embedding BLOB NOT NULL, UNIQUE(file_id, chunk_index)
+    );
+"#;
+
+const CREATE_INDEXES_V1: &str = r#"
+    CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
+    CREATE INDEX IF NOT EXISTS idx_documents_library ON documents(library_id);
+    CREATE INDEX IF NOT EXISTS idx_chunks_document ON document_chunks(document_id);
+    CREATE INDEX IF NOT EXISTS idx_code_files_project ON code_files(project_id);
+    CREATE INDEX IF NOT EXISTS idx_code_chunks_file ON code_chunks(file_id);
+"#;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseState {
+    Empty,
+    LegacyV0,
+    CurrentV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Preflight {
+    version: i32,
+    state: DatabaseState,
+}
+
 #[derive(Debug, Clone)]
 pub struct Database {
     path: PathBuf,
@@ -31,66 +97,192 @@ impl Database {
         let db = Self {
             path: path.as_ref().to_path_buf(),
         };
-        db.migrate()?;
+        db.initialize()?;
         Ok(db)
     }
 
     fn connection(&self) -> Result<Connection> {
         let connection = Connection::open(&self.path)
             .with_context(|| format!("No se pudo abrir SQLite: {}", self.path.display()))?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
+        Self::configure_connection(&connection)?;
         Ok(connection)
     }
 
-    fn migrate(&self) -> Result<()> {
-        self.connection()?.execute_batch(r#"
-            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS libraries (
-                id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+    fn configure_connection(connection: &Connection) -> Result<()> {
+        Self::configure_initialization_connection(connection)?;
+        connection.execute_batch("PRAGMA journal_mode=WAL;")?;
+        Ok(())
+    }
+
+    fn configure_initialization_connection(connection: &Connection) -> Result<()> {
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+        Ok(())
+    }
+
+    fn initialize(&self) -> Result<()> {
+        let preflight = if self.path.exists() {
+            let connection =
+                Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .with_context(|| {
+                        format!(
+                            "No se pudo abrir SQLite para verificar la base local: {}",
+                            self.path.display()
+                        )
+                    })?;
+            Self::preflight(&connection)?
+        } else {
+            let connection = self.initialization_connection()?;
+            let preflight = Self::preflight(&connection)?;
+            Self::initialize_preflighted(connection, preflight)?;
+            return Ok(());
+        };
+
+        let connection = self.initialization_connection()?;
+        let current = Self::classify_database(&connection)?;
+        if current != preflight {
+            anyhow::bail!(
+                "La base de datos local cambio mientras Kuznor la verificaba; cierre otras instancias e intente de nuevo"
             );
-            CREATE TABLE IF NOT EXISTS chats (
-                id INTEGER PRIMARY KEY, title TEXT NOT NULL, profile TEXT NOT NULL,
-                library_id INTEGER REFERENCES libraries(id) ON DELETE SET NULL,
-                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        }
+        Self::initialize_preflighted(connection, preflight)
+    }
+
+    fn initialization_connection(&self) -> Result<Connection> {
+        Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .with_context(|| {
+            format!(
+                "No se pudo abrir SQLite para inicializar la base local: {}",
+                self.path.display()
+            )
+        })
+    }
+
+    fn initialize_preflighted(mut connection: Connection, preflight: Preflight) -> Result<()> {
+        Self::configure_initialization_connection(&connection)?;
+        match preflight.state {
+            DatabaseState::CurrentV1 => Self::enable_wal(&connection),
+            DatabaseState::Empty | DatabaseState::LegacyV0 => {
+                Self::migrate_zero_to_one(&mut connection, preflight.state)?;
+                Self::run_quick_check(&connection)?;
+                Self::run_foreign_key_check(&connection)?;
+                Self::enable_wal(&connection)
+            }
+        }
+    }
+
+    fn enable_wal(connection: &Connection) -> Result<()> {
+        connection.execute_batch("PRAGMA journal_mode=WAL;")?;
+        Ok(())
+    }
+
+    fn preflight(connection: &Connection) -> Result<Preflight> {
+        Self::run_quick_check(connection)?;
+        let preflight = Self::classify_database(connection)?;
+        if preflight.state == DatabaseState::CurrentV1 {
+            Self::run_foreign_key_check(connection)?;
+        }
+        Ok(preflight)
+    }
+
+    fn classify_database(connection: &Connection) -> Result<Preflight> {
+        let version = Self::schema_version(connection)?;
+        let state = match version {
+            0 if Self::is_empty_database(connection)? => DatabaseState::Empty,
+            0 => {
+                validate_schema(connection, false).context(
+                    "La base local con user_version=0 no coincide con el esquema legacy v0.1 esperado",
+                )?;
+                DatabaseState::LegacyV0
+            }
+            CURRENT_SCHEMA_VERSION => {
+                validate_schema(connection, true)
+                    .context("La base local no coincide con el esquema Kuznor v1 esperado")?;
+                DatabaseState::CurrentV1
+            }
+            version if version > CURRENT_SCHEMA_VERSION => anyhow::bail!(
+                "La base de datos local usa el esquema {version}, mas reciente que el esquema {} soportado por esta version de Kuznor. Actualice Kuznor; la base no fue modificada.",
+                CURRENT_SCHEMA_VERSION
+            ),
+            version => anyhow::bail!(
+                "La base de datos local tiene user_version={version}, que Kuznor no reconoce. La base no fue modificada."
+            ),
+        };
+        Ok(Preflight { version, state })
+    }
+
+    fn migrate_zero_to_one(connection: &mut Connection, state: DatabaseState) -> Result<()> {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match state {
+            DatabaseState::Empty => transaction.execute_batch(CREATE_TABLES_V1)?,
+            DatabaseState::LegacyV0 => transaction.execute_batch(CREATE_INDEXES_V1)?,
+            DatabaseState::CurrentV1 => {
+                anyhow::bail!("Migracion 0 a 1 solicitada para una base ya actualizada")
+            }
+        }
+        if state == DatabaseState::Empty {
+            transaction.execute_batch(CREATE_INDEXES_V1)?;
+        }
+        validate_schema(&transaction, true)?;
+        Self::run_foreign_key_check(&transaction)?;
+        Self::run_quick_check(&transaction)?;
+        transaction.execute_batch(&format!("PRAGMA user_version={CURRENT_SCHEMA_VERSION};"))?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn schema_version(connection: &Connection) -> Result<i32> {
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .context("No se pudo leer PRAGMA user_version de la base local")
+    }
+
+    fn is_empty_database(connection: &Connection) -> Result<bool> {
+        let object_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type IN ('table','index','trigger','view') AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(object_count == 0)
+    }
+
+    fn run_quick_check(connection: &Connection) -> Result<()> {
+        let mut statement = connection.prepare("PRAGMA quick_check")?;
+        let results = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if results
+            .iter()
+            .all(|result| result.eq_ignore_ascii_case("ok"))
+        {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "La base de datos local no supero PRAGMA quick_check: {}. El archivo fue preservado.",
+                results.join("; ")
             );
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-                role TEXT NOT NULL, content TEXT NOT NULL, sources_json TEXT NOT NULL DEFAULT '[]',
-                created_at TEXT NOT NULL
+        }
+    }
+
+    fn run_foreign_key_check(connection: &Connection) -> Result<()> {
+        let issue = connection
+            .query_row("PRAGMA foreign_key_check", [], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .optional()?;
+        if let Some((table, row_id, parent)) = issue {
+            anyhow::bail!(
+                "La base de datos local tiene una relacion invalida: tabla {table}, fila {:?}, tabla padre {parent}. El archivo fue preservado.",
+                row_id
             );
-            CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY, library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
-                name TEXT NOT NULL, original_path TEXT NOT NULL, hash TEXT NOT NULL,
-                file_type TEXT NOT NULL, status TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL,
-                UNIQUE(library_id, hash)
-            );
-            CREATE TABLE IF NOT EXISTS document_chunks (
-                id INTEGER PRIMARY KEY, document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-                chunk_index INTEGER NOT NULL, content TEXT NOT NULL, page_number INTEGER,
-                section TEXT, embedding BLOB NOT NULL, UNIQUE(document_id, chunk_index)
-            );
-            CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
-            CREATE INDEX IF NOT EXISTS idx_documents_library ON documents(library_id);
-            CREATE INDEX IF NOT EXISTS idx_chunks_document ON document_chunks(document_id);
-            CREATE TABLE IF NOT EXISTS code_projects (
-                id INTEGER PRIMARY KEY, name TEXT NOT NULL, root_path TEXT NOT NULL UNIQUE,
-                status TEXT NOT NULL DEFAULT 'listo', last_opened TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS code_files (
-                id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES code_projects(id) ON DELETE CASCADE,
-                relative_path TEXT NOT NULL, hash TEXT NOT NULL, extension TEXT NOT NULL,
-                language TEXT NOT NULL, size_bytes INTEGER NOT NULL, error TEXT,
-                indexed_at TEXT NOT NULL, UNIQUE(project_id, relative_path)
-            );
-            CREATE TABLE IF NOT EXISTS code_chunks (
-                id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,
-                chunk_index INTEGER NOT NULL, line_start INTEGER NOT NULL, line_end INTEGER NOT NULL,
-                content TEXT NOT NULL, embedding BLOB NOT NULL, UNIQUE(file_id, chunk_index)
-            );
-            CREATE INDEX IF NOT EXISTS idx_code_files_project ON code_files(project_id);
-            CREATE INDEX IF NOT EXISTS idx_code_chunks_file ON code_chunks(file_id);
-        "#)?;
+        }
         Ok(())
     }
 
@@ -205,17 +397,31 @@ impl Database {
         let conn = self.connection()?;
         let mut stmt = conn.prepare("SELECT id,chat_id,role,content,sources_json,created_at FROM messages WHERE chat_id=?1 ORDER BY id")?;
         let rows = stmt.query_map([chat_id], |r| {
-            let json: String = r.get(4)?;
-            Ok(Message {
-                id: r.get(0)?,
-                chat_id: r.get(1)?,
-                role: r.get(2)?,
-                content: r.get(3)?,
-                sources: serde_json::from_str(&json).unwrap_or_default(),
-                created_at: r.get(5)?,
-            })
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut messages = Vec::new();
+        for row in rows {
+            let (id, chat_id, role, content, sources_json, created_at) = row?;
+            let sources = serde_json::from_str(&sources_json).with_context(|| {
+                format!("sources_json invalido en el mensaje {id} del chat {chat_id}")
+            })?;
+            messages.push(Message {
+                id,
+                chat_id,
+                role,
+                content,
+                sources,
+                created_at,
+            });
+        }
+        Ok(messages)
     }
 
     pub fn create_library(&self, name: &str) -> Result<i64> {
@@ -337,19 +543,36 @@ impl Database {
         let conn = self.connection()?;
         let mut stmt=conn.prepare("SELECT c.id,c.document_id,d.name,c.chunk_index,c.content,c.page_number,c.section,c.embedding FROM document_chunks c JOIN documents d ON d.id=c.document_id WHERE d.library_id=?1 AND d.status='listo'")?;
         let rows = stmt.query_map([library_id], |r| {
-            let bytes: Vec<u8> = r.get(7)?;
-            Ok(Chunk {
-                id: r.get(0)?,
-                document_id: r.get(1)?,
-                document_name: r.get(2)?,
-                chunk_index: r.get::<_, i64>(3)? as usize,
-                content: r.get(4)?,
-                page_number: r.get(5)?,
-                section: r.get(6)?,
-                embedding: bytes_to_embedding(&bytes).unwrap_or_default(),
-            })
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Vec<u8>>(7)?,
+            ))
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut chunks = Vec::new();
+        for row in rows {
+            let (id, document_id, document_name, chunk_index, content, page_number, section, bytes) =
+                row?;
+            let embedding = bytes_to_embedding(&bytes).with_context(|| {
+                format!("Embedding invalido en el chunk {id} del documento {document_id}")
+            })?;
+            chunks.push(Chunk {
+                id,
+                document_id,
+                document_name,
+                chunk_index: chunk_index as usize,
+                content,
+                page_number: page_number.map(|page| page as u32),
+                section,
+                embedding,
+            });
+        }
+        Ok(chunks)
     }
 
     pub fn upsert_code_project(&self, name: &str, root_path: &str) -> Result<i64> {
@@ -491,23 +714,342 @@ impl Database {
             "SELECT c.id,f.project_id,f.id,f.relative_path,f.extension,f.language,c.chunk_index,c.line_start,c.line_end,c.content,c.embedding FROM code_chunks c JOIN code_files f ON f.id=c.file_id JOIN code_projects p ON p.id=f.project_id WHERE f.project_id=?1 AND f.error IS NULL AND p.status IN ('ready','listo') ORDER BY f.relative_path,c.chunk_index",
         )?;
         let rows = statement.query_map([project_id], |row| {
-            let bytes: Vec<u8> = row.get(10)?;
-            Ok(CodeChunk {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                file_id: row.get(2)?,
-                relative_path: row.get(3)?,
-                extension: row.get(4)?,
-                language: row.get(5)?,
-                chunk_index: row.get::<_, i64>(6)? as usize,
-                line_start: row.get::<_, i64>(7)? as usize,
-                line_end: row.get::<_, i64>(8)? as usize,
-                content: row.get(9)?,
-                embedding: bytes_to_embedding(&bytes).unwrap_or_default(),
-            })
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Vec<u8>>(10)?,
+            ))
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut chunks = Vec::new();
+        for row in rows {
+            let (
+                id,
+                project_id,
+                file_id,
+                relative_path,
+                extension,
+                language,
+                chunk_index,
+                line_start,
+                line_end,
+                content,
+                bytes,
+            ) = row?;
+            let embedding = bytes_to_embedding(&bytes).with_context(|| {
+                format!("Embedding invalido en el chunk de codigo {id} del archivo {file_id}")
+            })?;
+            chunks.push(CodeChunk {
+                id,
+                project_id,
+                file_id,
+                relative_path,
+                extension,
+                language,
+                chunk_index: chunk_index as usize,
+                line_start: line_start as usize,
+                line_end: line_end as usize,
+                content,
+                embedding,
+            });
+        }
+        Ok(chunks)
     }
+}
+
+fn validate_schema(connection: &Connection, require_indexes: bool) -> Result<()> {
+    for (table, columns) in [
+        ("settings", &["key", "value"][..]),
+        ("libraries", &["id", "name", "created_at"][..]),
+        (
+            "chats",
+            &[
+                "id",
+                "title",
+                "profile",
+                "library_id",
+                "created_at",
+                "updated_at",
+            ][..],
+        ),
+        (
+            "messages",
+            &[
+                "id",
+                "chat_id",
+                "role",
+                "content",
+                "sources_json",
+                "created_at",
+            ][..],
+        ),
+        (
+            "documents",
+            &[
+                "id",
+                "library_id",
+                "name",
+                "original_path",
+                "hash",
+                "file_type",
+                "status",
+                "error",
+                "created_at",
+            ][..],
+        ),
+        (
+            "document_chunks",
+            &[
+                "id",
+                "document_id",
+                "chunk_index",
+                "content",
+                "page_number",
+                "section",
+                "embedding",
+            ][..],
+        ),
+        (
+            "code_projects",
+            &["id", "name", "root_path", "status", "last_opened"][..],
+        ),
+        (
+            "code_files",
+            &[
+                "id",
+                "project_id",
+                "relative_path",
+                "hash",
+                "extension",
+                "language",
+                "size_bytes",
+                "error",
+                "indexed_at",
+            ][..],
+        ),
+        (
+            "code_chunks",
+            &[
+                "id",
+                "file_id",
+                "chunk_index",
+                "line_start",
+                "line_end",
+                "content",
+                "embedding",
+            ][..],
+        ),
+    ] {
+        validate_table_columns(connection, table, columns)?;
+    }
+
+    for (table, column) in [
+        ("settings", "key"),
+        ("libraries", "id"),
+        ("chats", "id"),
+        ("messages", "id"),
+        ("documents", "id"),
+        ("document_chunks", "id"),
+        ("code_projects", "id"),
+        ("code_files", "id"),
+        ("code_chunks", "id"),
+    ] {
+        validate_primary_key(connection, table, column)?;
+    }
+
+    for (table, columns) in [
+        ("libraries", &["name"][..]),
+        ("documents", &["library_id", "hash"][..]),
+        ("document_chunks", &["document_id", "chunk_index"][..]),
+        ("code_projects", &["root_path"][..]),
+        ("code_files", &["project_id", "relative_path"][..]),
+        ("code_chunks", &["file_id", "chunk_index"][..]),
+    ] {
+        validate_unique_index(connection, table, columns)?;
+    }
+
+    for (table, column, parent_table, parent_column, on_delete) in [
+        ("chats", "library_id", "libraries", "id", "SET NULL"),
+        ("messages", "chat_id", "chats", "id", "CASCADE"),
+        ("documents", "library_id", "libraries", "id", "CASCADE"),
+        (
+            "document_chunks",
+            "document_id",
+            "documents",
+            "id",
+            "CASCADE",
+        ),
+        ("code_files", "project_id", "code_projects", "id", "CASCADE"),
+        ("code_chunks", "file_id", "code_files", "id", "CASCADE"),
+    ] {
+        validate_foreign_key(
+            connection,
+            table,
+            column,
+            parent_table,
+            parent_column,
+            on_delete,
+        )?;
+    }
+
+    if require_indexes {
+        for (index, table, columns) in [
+            ("idx_messages_chat", "messages", &["chat_id", "id"][..]),
+            ("idx_documents_library", "documents", &["library_id"][..]),
+            (
+                "idx_chunks_document",
+                "document_chunks",
+                &["document_id"][..],
+            ),
+            ("idx_code_files_project", "code_files", &["project_id"][..]),
+            ("idx_code_chunks_file", "code_chunks", &["file_id"][..]),
+        ] {
+            validate_named_index(connection, index, table, columns)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_table_columns(
+    connection: &Connection,
+    table: &str,
+    expected_columns: &[&str],
+) -> Result<()> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        anyhow::bail!("Falta la tabla requerida {table}");
+    }
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for expected in expected_columns {
+        if !columns.iter().any(|column| column == expected) {
+            anyhow::bail!("Falta la columna requerida {table}.{expected}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_primary_key(connection: &Connection, table: &str, expected_column: &str) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let primary_key_columns = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+        })?
+        .filter_map(|row| match row {
+            Ok((column, position)) if position > 0 => Some(Ok((column, position))),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if primary_key_columns != [(expected_column.to_owned(), 1)] {
+        anyhow::bail!("La clave primaria de {table} no coincide con el esquema esperado");
+    }
+    Ok(())
+}
+
+fn validate_unique_index(
+    connection: &Connection,
+    table: &str,
+    expected_columns: &[&str],
+) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA index_list({table})"))?;
+    let indexes = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (index, is_unique) in indexes {
+        if is_unique == 0 {
+            continue;
+        }
+        if index_columns(connection, &index)? == expected_columns {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "Falta la restriccion UNIQUE requerida en {}({})",
+        table,
+        expected_columns.join(", ")
+    )
+}
+
+fn validate_foreign_key(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    parent_table: &str,
+    parent_column: &str,
+    on_delete: &str,
+) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
+    let keys = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if keys.iter().any(|(parent, from, to, delete_action)| {
+        parent == parent_table
+            && from == column
+            && to == parent_column
+            && delete_action.eq_ignore_ascii_case(on_delete)
+    }) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Falta la relacion requerida {table}.{column} -> {parent_table}.{parent_column} ON DELETE {on_delete}"
+        )
+    }
+}
+
+fn validate_named_index(
+    connection: &Connection,
+    index: &str,
+    table: &str,
+    expected_columns: &[&str],
+) -> Result<()> {
+    let indexed_table: Option<String> = connection
+        .query_row(
+            "SELECT tbl_name FROM sqlite_schema WHERE type='index' AND name=?1",
+            [index],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if indexed_table.as_deref() != Some(table)
+        || index_columns(connection, index)? != expected_columns
+    {
+        anyhow::bail!(
+            "Falta o es incompatible el indice requerido {index} sobre {}({})",
+            table,
+            expected_columns.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn index_columns(connection: &Connection, index: &str) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(&format!("PRAGMA index_info({index})"))?;
+    statement
+        .query_map([], |row| row.get::<_, String>(2))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 fn document_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
@@ -543,6 +1085,297 @@ pub fn bytes_to_embedding(bytes: &[u8]) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn schema_version(path: &Path) -> i32 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn create_legacy_v0(path: &Path) -> Connection {
+        let connection = Connection::open(path).unwrap();
+        connection.execute_batch(CREATE_TABLES_V1).unwrap();
+        connection.execute_batch("PRAGMA user_version=0;").unwrap();
+        connection
+    }
+
+    fn schema_object_exists(path: &Path, kind: &str, name: &str) -> bool {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn new_database_creates_schema_version_one() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("new.db");
+
+        Database::open(&path).unwrap();
+
+        assert_eq!(schema_version(&path), CURRENT_SCHEMA_VERSION);
+        assert!(schema_object_exists(&path, "index", "idx_messages_chat"));
+    }
+
+    #[test]
+    fn legacy_v0_migration_preserves_chat_document_and_code_data() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("legacy.db");
+        let connection = create_legacy_v0(&path);
+        connection
+            .execute_batch(
+                "
+                INSERT INTO libraries(id,name,created_at) VALUES(1,'Trabajo','2026-01-01T00:00:00Z');
+                INSERT INTO chats(id,title,profile,library_id,created_at,updated_at)
+                    VALUES(1,'Conversacion','general',1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                INSERT INTO messages(id,chat_id,role,content,sources_json,created_at)
+                    VALUES(1,1,'user','hola','[]','2026-01-01T00:00:00Z');
+                INSERT INTO documents(id,library_id,name,original_path,hash,file_type,status,created_at)
+                    VALUES(1,1,'manual.txt','C:/manual.txt','hash','txt','listo','2026-01-01T00:00:00Z');
+                INSERT INTO document_chunks(id,document_id,chunk_index,content,embedding)
+                    VALUES(1,1,0,'contenido',X'0000803F');
+                INSERT INTO code_projects(id,name,root_path,status,last_opened)
+                    VALUES(1,'Proyecto','C:/proyecto','listo','2026-01-01T00:00:00Z');
+                INSERT INTO code_files(id,project_id,relative_path,hash,extension,language,size_bytes,indexed_at)
+                    VALUES(1,1,'src/main.rs','hash','rs','rust',10,'2026-01-01T00:00:00Z');
+                INSERT INTO code_chunks(id,file_id,chunk_index,line_start,line_end,content,embedding)
+                    VALUES(1,1,0,1,1,'fn main() {}',X'0000803F');
+                ",
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+
+        assert_eq!(schema_version(&path), CURRENT_SCHEMA_VERSION);
+        assert_eq!(database.messages(1).unwrap()[0].content, "hola");
+        assert_eq!(database.list_libraries().unwrap()[0].name, "Trabajo");
+        assert_eq!(database.library_chunks(1).unwrap()[0].content, "contenido");
+        assert_eq!(database.code_chunks(1).unwrap()[0].content, "fn main() {}");
+    }
+
+    #[test]
+    fn legacy_v0_migration_creates_missing_safe_indexes() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("legacy-indexes.db");
+        drop(create_legacy_v0(&path));
+
+        Database::open(&path).unwrap();
+
+        assert_eq!(schema_version(&path), CURRENT_SCHEMA_VERSION);
+        for index in [
+            "idx_messages_chat",
+            "idx_documents_library",
+            "idx_chunks_document",
+            "idx_code_files_project",
+            "idx_code_chunks_file",
+        ] {
+            assert!(schema_object_exists(&path, "index", index));
+        }
+    }
+
+    #[test]
+    fn opening_current_schema_is_idempotent() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("current.db");
+        let database = Database::open(&path).unwrap();
+        let chat_id = database
+            .create_chat("Persistente", Profile::General)
+            .unwrap();
+        drop(database);
+
+        let reopened = Database::open(&path).unwrap();
+
+        assert_eq!(schema_version(&path), CURRENT_SCHEMA_VERSION);
+        assert_eq!(reopened.list_chats().unwrap()[0].id, chat_id);
+    }
+
+    #[test]
+    fn future_schema_is_rejected_without_modifying_it() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("future.db");
+        Database::open(&path).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version=2;")
+            .unwrap();
+
+        let error = format!("{:#}", Database::open(&path).unwrap_err());
+
+        assert!(error.contains("mas reciente"));
+        assert_eq!(schema_version(&path), 2);
+        assert!(schema_object_exists(&path, "index", "idx_messages_chat"));
+    }
+
+    #[test]
+    fn partial_legacy_database_is_rejected_without_schema_repair() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("partial.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        drop(connection);
+
+        let error = format!("{:#}", Database::open(&path).unwrap_err());
+
+        assert!(error.contains("esquema legacy v0.1"));
+        assert!(!schema_object_exists(&path, "table", "libraries"));
+        assert_eq!(schema_version(&path), 0);
+    }
+
+    #[test]
+    fn legacy_database_missing_required_column_is_rejected() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("missing-column.db");
+        let connection = create_legacy_v0(&path);
+        connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        connection
+            .execute_batch("ALTER TABLE messages DROP COLUMN sources_json;")
+            .unwrap();
+        drop(connection);
+
+        let error = format!("{:#}", Database::open(&path).unwrap_err());
+
+        assert!(error.contains("messages.sources_json"));
+        assert_eq!(schema_version(&path), 0);
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_and_can_be_retried() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("rollback.db");
+        let connection = create_legacy_v0(&path);
+        connection
+            .execute_batch("CREATE TABLE idx_documents_library (value TEXT);")
+            .unwrap();
+        drop(connection);
+
+        assert!(Database::open(&path).is_err());
+        assert_eq!(schema_version(&path), 0);
+        assert!(!schema_object_exists(&path, "index", "idx_messages_chat"));
+
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE idx_documents_library;")
+            .unwrap();
+        Database::open(&path).unwrap();
+        assert_eq!(schema_version(&path), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn corrupt_database_is_rejected_without_modifying_bytes() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("corrupt.db");
+        let bytes = b"esto no es una base sqlite";
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(Database::open(&path).is_err());
+
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn invalid_foreign_keys_block_legacy_migration_without_version_change() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("invalid-fk.db");
+        let connection = create_legacy_v0(&path);
+        connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO chats(id,title,profile,library_id,created_at,updated_at)
+                 VALUES(1,'Huerfano','general',999,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = Database::open(&path).unwrap_err().to_string();
+
+        assert!(error.contains("relacion invalida"));
+        assert_eq!(schema_version(&path), 0);
+        assert!(!schema_object_exists(&path, "index", "idx_messages_chat"));
+    }
+
+    #[test]
+    fn invalid_sources_json_returns_contextual_error() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("bad-sources.db");
+        let database = Database::open(&path).unwrap();
+        let chat_id = database.create_chat("Chat", Profile::General).unwrap();
+        database.add_message(chat_id, "user", "hola", &[]).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE messages SET sources_json='{invalido' WHERE chat_id=?1",
+                [chat_id],
+            )
+            .unwrap();
+
+        let error = database.messages(chat_id).unwrap_err().to_string();
+
+        assert!(error.contains("sources_json invalido"));
+        assert!(error.contains(&format!("chat {chat_id}")));
+    }
+
+    #[test]
+    fn invalid_document_embedding_returns_contextual_error() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("bad-document-embedding.db");
+        let database = Database::open(&path).unwrap();
+        let library = database.create_library("Biblioteca").unwrap();
+        let document = database
+            .create_document(library, "manual.txt", "manual.txt", "hash", "txt")
+            .unwrap();
+        database.save_chunks(document, &[]).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO document_chunks(document_id,chunk_index,content,embedding) VALUES(?1,0,'dato',X'01')",
+                [document],
+            )
+            .unwrap();
+
+        let error = database.library_chunks(library).unwrap_err().to_string();
+
+        assert!(error.contains("Embedding invalido"));
+        assert!(error.contains(&format!("documento {document}")));
+    }
+
+    #[test]
+    fn invalid_code_embedding_returns_contextual_error() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("bad-code-embedding.db");
+        let database = Database::open(&path).unwrap();
+        let project = database
+            .upsert_code_project("Proyecto", "C:/proyecto")
+            .unwrap();
+        let file = database
+            .upsert_code_file(project, "main.rs", "hash", "rs", "rust", 1, None)
+            .unwrap();
+        database.set_code_project_status(project, "ready").unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO code_chunks(file_id,chunk_index,line_start,line_end,content,embedding) VALUES(?1,0,1,1,'dato',X'01')",
+                [file],
+            )
+            .unwrap();
+
+        let error = database.code_chunks(project).unwrap_err().to_string();
+
+        assert!(error.contains("Embedding invalido"));
+        assert!(error.contains(&format!("archivo {file}")));
+    }
+
     #[test]
     fn sqlite_and_messages_persist() {
         let d = tempfile::tempdir_in("target").unwrap();
