@@ -1,9 +1,10 @@
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -11,6 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
+use rusqlite::{Connection, OpenFlags, backup::Backup};
 
 use crate::{
     ai::{
@@ -212,25 +214,202 @@ fn sources_for_library(
         .collect()
 }
 
+const APP_DATA_DIRECTORY: &str = "Kuznor";
+const DATABASE_FILE: &str = "kuznor.db";
+static MIGRATION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 fn database_path() -> Result<PathBuf> {
-    let directory = std::env::current_dir().context("No se pudo determinar la carpeta de datos")?;
-    database_path_in(&directory)
+    let legacy_directory = std::env::current_dir()
+        .context("No se pudo determinar la carpeta de la instalacion anterior")?;
+    database_path_in(&user_data_directory()?, &legacy_directory)
 }
 
-fn database_path_in(directory: &Path) -> Result<PathBuf> {
-    let current = directory.join("kuznor.db");
-    let legacy = directory.join("inference_local.db");
-    if current.exists() || !legacy.exists() {
-        return Ok(current);
+fn user_data_directory() -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let local_app_data = std::env::var_os("LOCALAPPDATA").context(
+            "No se pudo resolver LOCALAPPDATA. Kuznor necesita un directorio de datos local del usuario.",
+        )?;
+        return user_data_directory_from_local_appdata(Some(Path::new(&local_app_data)));
     }
-    std::fs::copy(&legacy, &current).with_context(|| {
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .context("No se pudo resolver HOME para el directorio de datos de Kuznor.")?;
+        return Ok(PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join(APP_DATA_DIRECTORY));
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        if let Some(directory) =
+            std::env::var_os("XDG_DATA_HOME").filter(|directory| !directory.is_empty())
+        {
+            return Ok(PathBuf::from(directory).join(APP_DATA_DIRECTORY));
+        }
+        let home = std::env::var_os("HOME")
+            .context("No se pudo resolver HOME para el directorio de datos de Kuznor.")?;
+        return Ok(PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join(APP_DATA_DIRECTORY));
+    }
+}
+
+fn user_data_directory_from_local_appdata(local_app_data: Option<&Path>) -> Result<PathBuf> {
+    let local_app_data = local_app_data.context(
+        "No se pudo resolver LOCALAPPDATA. Kuznor necesita un directorio de datos local del usuario.",
+    )?;
+    if local_app_data.as_os_str().is_empty() {
+        anyhow::bail!(
+            "LOCALAPPDATA esta vacio. Kuznor necesita un directorio de datos local del usuario."
+        );
+    }
+    Ok(local_app_data.join(APP_DATA_DIRECTORY))
+}
+
+fn database_path_in(data_directory: &Path, legacy_directory: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(data_directory).with_context(|| {
         format!(
-            "No se pudo migrar la base anterior {} a {}",
-            legacy.display(),
-            current.display()
+            "No se pudo crear el directorio de datos de Kuznor: {}",
+            data_directory.display()
         )
     })?;
-    Ok(current)
+    if !data_directory.is_dir() {
+        anyhow::bail!(
+            "La ruta de datos de Kuznor no es un directorio: {}",
+            data_directory.display()
+        );
+    }
+
+    let destination = data_directory.join(DATABASE_FILE);
+    if destination.exists() {
+        return Ok(destination);
+    }
+
+    let legacy = [DATABASE_FILE, "inference_local.db"]
+        .into_iter()
+        .map(|name| legacy_directory.join(name))
+        .find(|path| path.is_file());
+    if let Some(legacy) = legacy {
+        migrate_legacy_database(&legacy, &destination)?;
+    }
+    Ok(destination)
+}
+
+fn migration_temporary_path(destination: &Path) -> Result<PathBuf> {
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("El archivo de datos de Kuznor no tiene un nombre valido")?;
+    for _ in 0..32 {
+        let sequence = MIGRATION_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = destination.with_file_name(format!(
+            "{file_name}.migrating-{}-{sequence}",
+            std::process::id()
+        ));
+        if !temporary.exists() {
+            return Ok(temporary);
+        }
+    }
+    anyhow::bail!("No se pudo reservar un archivo temporal para migrar la base de datos de Kuznor")
+}
+
+fn copy_legacy_database_snapshot(legacy: &Path, temporary: &Path) -> Result<()> {
+    let source = Connection::open_with_flags(legacy, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("No se pudo abrir la base anterior {}", legacy.display()))?;
+    let mut destination = Connection::open_with_flags(
+        temporary,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .with_context(|| {
+        format!(
+            "No se pudo crear o abrir la copia temporal de la base de datos: {}",
+            temporary.display()
+        )
+    })?;
+    {
+        let backup = Backup::new(&source, &mut destination)
+            .context("No se pudo iniciar la copia SQLite de la base anterior")?;
+        backup
+            .run_to_completion(100, Duration::from_millis(10), None)
+            .context("No se pudo completar la copia SQLite de la base anterior")?;
+    }
+    destination
+        .close()
+        .map_err(|(_, error)| error)
+        .with_context(|| {
+            format!(
+                "No se pudo cerrar la copia temporal de la base de datos: {}",
+                temporary.display()
+            )
+        })?;
+    source
+        .close()
+        .map_err(|(_, error)| error)
+        .with_context(|| {
+            format!(
+                "No se pudo cerrar la base anterior despues de copiarla: {}",
+                legacy.display()
+            )
+        })?;
+    Ok(())
+}
+
+fn verify_migrated_database(temporary: &Path) -> Result<()> {
+    if fs::metadata(temporary)
+        .with_context(|| {
+            format!(
+                "No se pudo verificar la copia temporal {}",
+                temporary.display()
+            )
+        })?
+        .len()
+        == 0
+    {
+        anyhow::bail!("La copia temporal de la base de datos quedo vacia");
+    }
+    let connection = Connection::open_with_flags(temporary, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| {
+            format!(
+                "La copia temporal de la base de datos no se pudo abrir: {}",
+                temporary.display()
+            )
+        })?;
+    let quick_check: String = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .context("La comprobacion SQLite de la copia temporal fallo")?;
+    if !quick_check.eq_ignore_ascii_case("ok") {
+        anyhow::bail!("La comprobacion SQLite de la copia temporal fallo: {quick_check}");
+    }
+    Ok(())
+}
+
+fn migrate_legacy_database(legacy: &Path, destination: &Path) -> Result<()> {
+    let temporary = migration_temporary_path(destination)?;
+    let result = (|| -> Result<()> {
+        copy_legacy_database_snapshot(legacy, &temporary)?;
+        verify_migrated_database(&temporary)?;
+
+        if destination.exists() {
+            return Ok(());
+        }
+        match fs::hard_link(&temporary, destination) {
+            Ok(()) => Ok(()),
+            Err(_error) if destination.exists() => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "No se pudo finalizar sin sobrescritura la migracion hacia {}",
+                    destination.display()
+                )
+            }),
+        }
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
 }
 
 pub struct KuznorApp {
@@ -2560,16 +2739,23 @@ fn service_status_label(status: &ServiceStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        View, active_library_for_sidebar, automatic_title, captured_code_file,
-        chat_status_after_health, chat_view_for_profile, database_path_in,
-        generation_belongs_to_chat, sources_for_code_scope, sources_for_library, startup_view,
-        status_after_health, status_after_request, valid_selected_code_file,
+        APP_DATA_DIRECTORY, DATABASE_FILE, View, active_library_for_sidebar, automatic_title,
+        captured_code_file, chat_status_after_health, chat_view_for_profile,
+        copy_legacy_database_snapshot, database_path_in, generation_belongs_to_chat,
+        migrate_legacy_database, sources_for_code_scope, sources_for_library, startup_view,
+        status_after_health, status_after_request, user_data_directory_from_local_appdata,
+        valid_selected_code_file,
     };
     use crate::{
         ai::process::ServiceStatus,
         code::types::CodeFile,
         db::Database,
         models::{Profile, Source},
+    };
+    use rusqlite::Connection;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
     };
 
     #[test]
@@ -2732,25 +2918,320 @@ mod tests {
     }
 
     #[test]
-    fn legacy_database_is_copied_to_kuznor_name() {
+    fn creates_a_missing_user_data_directory() {
         let directory = tempfile::tempdir_in("target").unwrap();
-        let legacy = directory.path().join("inference_local.db");
+        let data_directory = directory.path().join("user-data/Kuznor");
+        let legacy_directory = directory.path().join("legacy");
+        fs::create_dir(&legacy_directory).unwrap();
+
+        let database = database_path_in(&data_directory, &legacy_directory).unwrap();
+
+        assert!(data_directory.is_dir());
+        assert_eq!(database, data_directory.join(DATABASE_FILE));
+        assert!(!database.exists());
+    }
+
+    #[test]
+    fn legacy_database_is_copied_to_user_data_directory() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let legacy_directory = directory.path().join("legacy");
+        let data_directory = directory.path().join("user-data/Kuznor");
+        fs::create_dir(&legacy_directory).unwrap();
+        let legacy = legacy_directory.join("inference_local.db");
         let database = Database::open(&legacy).unwrap();
         database
             .create_chat("Conversacion anterior", Profile::General)
             .unwrap();
         drop(database);
 
-        let migrated = database_path_in(directory.path()).unwrap();
-        assert_eq!(migrated.file_name().unwrap(), "kuznor.db");
+        let migrated = database_path_in(&data_directory, &legacy_directory).unwrap();
+        assert_eq!(migrated, data_directory.join(DATABASE_FILE));
         assert_eq!(
-            Database::open(migrated)
+            Database::open(&migrated)
                 .unwrap()
                 .list_chats()
                 .unwrap()
                 .len(),
             1
         );
+        assert!(legacy.exists());
+        assert_eq!(
+            Database::open(&legacy).unwrap().list_chats().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn backup_api_copies_a_normal_legacy_database() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let legacy = directory.path().join("legacy.db");
+        let temporary = directory.path().join("temporary.db");
+        let legacy_db = Database::open(&legacy).unwrap();
+        legacy_db
+            .create_chat("Respaldado", Profile::General)
+            .unwrap();
+        drop(legacy_db);
+
+        copy_legacy_database_snapshot(&legacy, &temporary).unwrap();
+
+        let chats = Database::open(&temporary).unwrap().list_chats().unwrap();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].title, "Respaldado");
+        assert_eq!(
+            Database::open(&legacy).unwrap().list_chats().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn migration_preserves_legacy_data_stored_in_wal() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let legacy_directory = directory.path().join("legacy");
+        let data_directory = directory.path().join("user-data/Kuznor");
+        fs::create_dir(&legacy_directory).unwrap();
+        let legacy = legacy_directory.join("inference_local.db");
+        let writer = Connection::open(&legacy).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+                 CREATE TABLE preserved_wal_data(value TEXT NOT NULL); \
+                 INSERT INTO preserved_wal_data(value) VALUES('preservado');",
+            )
+            .unwrap();
+        assert!(legacy.with_extension("db-wal").exists());
+
+        let migrated = database_path_in(&data_directory, &legacy_directory).unwrap();
+
+        let migrated_connection = Connection::open(migrated).unwrap();
+        let preserved: String = migrated_connection
+            .query_row("SELECT value FROM preserved_wal_data", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(preserved, "preservado");
+        drop(writer);
+    }
+
+    #[test]
+    fn existing_user_database_is_never_overwritten_by_legacy_database() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let legacy_directory = directory.path().join("legacy");
+        let data_directory = directory.path().join("user-data/Kuznor");
+        fs::create_dir_all(&legacy_directory).unwrap();
+        fs::create_dir_all(&data_directory).unwrap();
+        let legacy = legacy_directory.join(DATABASE_FILE);
+        let legacy_db = Database::open(&legacy).unwrap();
+        legacy_db.create_chat("Legacy", Profile::General).unwrap();
+        drop(legacy_db);
+        let destination = data_directory.join(DATABASE_FILE);
+        let destination_db = Database::open(&destination).unwrap();
+        destination_db
+            .create_chat("Destino", Profile::General)
+            .unwrap();
+        drop(destination_db);
+
+        let resolved = database_path_in(&data_directory, &legacy_directory).unwrap();
+
+        assert_eq!(resolved, destination);
+        let chats = Database::open(&resolved).unwrap().list_chats().unwrap();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].title, "Destino");
+        assert!(legacy.exists());
+    }
+
+    #[test]
+    fn current_legacy_database_has_priority_over_inference_legacy_database() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let legacy_directory = directory.path().join("legacy");
+        let data_directory = directory.path().join("user-data/Kuznor");
+        fs::create_dir(&legacy_directory).unwrap();
+        let current = legacy_directory.join(DATABASE_FILE);
+        let current_db = Database::open(&current).unwrap();
+        current_db.create_chat("Actual", Profile::General).unwrap();
+        drop(current_db);
+        let inference = legacy_directory.join("inference_local.db");
+        let inference_db = Database::open(&inference).unwrap();
+        inference_db
+            .create_chat("Anterior", Profile::General)
+            .unwrap();
+        drop(inference_db);
+
+        let migrated = database_path_in(&data_directory, &legacy_directory).unwrap();
+
+        let chats = Database::open(migrated).unwrap().list_chats().unwrap();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].title, "Actual");
+        assert!(current.exists());
+        assert!(inference.exists());
+    }
+
+    #[test]
+    fn second_resolution_uses_new_database_without_recopying_legacy_data() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let legacy_directory = directory.path().join("legacy");
+        let data_directory = directory.path().join("user-data/Kuznor");
+        fs::create_dir(&legacy_directory).unwrap();
+        let legacy = legacy_directory.join("inference_local.db");
+        let legacy_db = Database::open(&legacy).unwrap();
+        legacy_db.create_chat("Primero", Profile::General).unwrap();
+        drop(legacy_db);
+
+        let first = database_path_in(&data_directory, &legacy_directory).unwrap();
+        let legacy_db = Database::open(&legacy).unwrap();
+        legacy_db.create_chat("Segundo", Profile::General).unwrap();
+        drop(legacy_db);
+        let second = database_path_in(&data_directory, &legacy_directory).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            Database::open(second).unwrap().list_chats().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            Database::open(&legacy).unwrap().list_chats().unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn failed_temporary_open_preserves_source_and_leaves_no_final_or_temporary_database() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let legacy = directory.path().join("legacy.db");
+        let legacy_db = Database::open(&legacy).unwrap();
+        legacy_db.create_chat("Origen", Profile::General).unwrap();
+        drop(legacy_db);
+        let blocked_parent = directory.path().join("not-a-directory");
+        fs::write(&blocked_parent, "blocked").unwrap();
+        let destination = blocked_parent.join(DATABASE_FILE);
+        let temporary = destination
+            .with_file_name(format!("{DATABASE_FILE}.migrating-{}-", std::process::id()));
+
+        assert!(migrate_legacy_database(&legacy, &destination).is_err());
+
+        assert_eq!(
+            Database::open(&legacy).unwrap().list_chats().unwrap().len(),
+            1
+        );
+        assert!(!destination.exists());
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn data_destination_is_independent_from_legacy_working_directory() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let data_directory = directory.path().join("user-data/Kuznor");
+        let first_working_directory = directory.path().join("first-working-directory");
+        let second_working_directory = directory.path().join("second-working-directory");
+        fs::create_dir(&first_working_directory).unwrap();
+        fs::create_dir(&second_working_directory).unwrap();
+
+        let first = database_path_in(&data_directory, &first_working_directory).unwrap();
+        let second = database_path_in(&data_directory, &second_working_directory).unwrap();
+
+        assert_eq!(first, data_directory.join(DATABASE_FILE));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn windows_local_appdata_resolution_requires_a_real_value() {
+        assert!(user_data_directory_from_local_appdata(None).is_err());
+        assert_eq!(
+            user_data_directory_from_local_appdata(Some(Path::new("C:/Users/Test/AppData/Local")))
+                .unwrap(),
+            PathBuf::from("C:/Users/Test/AppData/Local").join(APP_DATA_DIRECTORY)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "diagnostico manual: crea archivos temporales unicos en el workspace y LOCALAPPDATA/Kuznor"]
+    fn windows_workspace_and_localappdata_write_probe() -> anyhow::Result<()> {
+        use anyhow::Context;
+        use std::{
+            fs::File,
+            io::Write,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        fn remove_probe(path: &Path) -> std::io::Result<()> {
+            match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+
+        fn write_probe(path: &Path) -> std::io::Result<()> {
+            let mut file = File::create(path)?;
+            file.write_all(b"kuznor write probe")?;
+            file.flush()?;
+            drop(file);
+            Ok(())
+        }
+
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .context("LOCALAPPDATA no esta disponible para la prueba diagnostica")?;
+        let local_data_directory = PathBuf::from(local_app_data).join(APP_DATA_DIRECTORY);
+        let workspace_directory = std::env::current_dir()
+            .context("No se pudo resolver el directorio actual del workspace")?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("El reloj del sistema es anterior a UNIX_EPOCH")?
+            .as_nanos();
+        let unique = format!("kuznor-diagnostic-{}-{nonce}", std::process::id());
+        let workspace_probe = workspace_directory.join(format!("{unique}-workspace.tmp"));
+        let local_probe = local_data_directory.join(format!("{unique}-localappdata.tmp"));
+
+        println!("diagnostic.process_id={}", std::process::id());
+        println!(
+            "diagnostic.username={}",
+            std::env::var("USERNAME").unwrap_or_default()
+        );
+        println!(
+            "diagnostic.userdomain={}",
+            std::env::var("USERDOMAIN").unwrap_or_default()
+        );
+        println!(
+            "diagnostic.workspace_path={}",
+            workspace_directory.display()
+        );
+        let workspace_result = write_probe(&workspace_probe);
+        match &workspace_result {
+            Ok(()) => println!("diagnostic.workspace_file_create=ok raw_os_error=None"),
+            Err(error) => println!(
+                "diagnostic.workspace_file_create=error kind={:?} raw_os_error={:?} message={error}",
+                error.kind(),
+                error.raw_os_error()
+            ),
+        }
+        let workspace_cleanup = remove_probe(&workspace_probe);
+
+        println!(
+            "diagnostic.localappdata_path={}",
+            local_data_directory.display()
+        );
+        let local_result = write_probe(&local_probe);
+        match &local_result {
+            Ok(()) => println!("diagnostic.localappdata_file_create=ok raw_os_error=None"),
+            Err(error) => println!(
+                "diagnostic.localappdata_file_create=error kind={:?} raw_os_error={:?} message={error}",
+                error.kind(),
+                error.raw_os_error()
+            ),
+        }
+        let local_cleanup = remove_probe(&local_probe);
+
+        workspace_cleanup.context("No se pudo limpiar el probe del workspace")?;
+        local_cleanup.context("No se pudo limpiar el probe de LOCALAPPDATA")?;
+        match (workspace_result, local_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(error)) => Err(error)
+                .context("Workspace escribible, pero LOCALAPPDATA rechazo std::fs::File::create"),
+            (Err(error), Ok(())) => Err(error).context(
+                "El workspace rechazo std::fs::File::create mientras LOCALAPPDATA funciono",
+            ),
+            (Err(workspace), Err(local)) => anyhow::bail!(
+                "Workspace y LOCALAPPDATA rechazaron std::fs::File::create: workspace={workspace}; localappdata={local}"
+            ),
+        }
     }
 
     #[test]
