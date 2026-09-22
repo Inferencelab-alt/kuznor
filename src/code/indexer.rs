@@ -1,5 +1,5 @@
 use std::{
-    fs::File,
+    fs::{self, File},
     io::Read,
     path::Path,
     sync::{
@@ -87,6 +87,7 @@ pub enum SourceReadErrorKind {
     InvalidUtf8,
     Binary,
     Changed,
+    UnsafePath,
 }
 
 #[derive(Debug)]
@@ -109,15 +110,24 @@ pub fn source_read_error_kind(error: &anyhow::Error) -> Option<SourceReadErrorKi
         .map(|error| error.kind)
 }
 
-pub fn read_source(path: &Path) -> Result<SourceContent> {
-    let mut file =
-        File::open(path).with_context(|| format!("No se pudo abrir {}", path.display()))?;
+pub fn read_source(root: &Path, path: &Path) -> Result<SourceContent> {
+    let canonical = validated_source_path(root, path)?;
+    let mut file = File::open(&canonical)
+        .with_context(|| format!("No se pudo abrir {}", canonical.display()))?;
     let before = file
         .metadata()
-        .with_context(|| format!("No se pudo obtener metadata de {}", path.display()))?;
+        .with_context(|| format!("No se pudo obtener metadata de {}", canonical.display()))?;
     let bytes = read_bounded(&mut file, MAX_FILE_BYTES)?;
-    let after = std::fs::metadata(path)
-        .with_context(|| format!("No se pudo obtener metadata final de {}", path.display()))?;
+    let canonical_after = validated_source_path(root, path)?;
+    if canonical_after != canonical {
+        return unsafe_path_error(path, "La ruta cambio mientras se leia");
+    }
+    let after = fs::metadata(&canonical).with_context(|| {
+        format!(
+            "No se pudo obtener metadata final de {}",
+            canonical.display()
+        )
+    })?;
     if metadata_changed(&before, &after) {
         return Err(SourceReadError {
             kind: SourceReadErrorKind::Changed,
@@ -125,17 +135,65 @@ pub fn read_source(path: &Path) -> Result<SourceContent> {
         }
         .into());
     }
-    decode_source(bytes, path, after.len(), after.modified().ok())
+    decode_source(bytes, &canonical, after.len(), after.modified().ok())
 }
 
-pub fn source_unchanged(path: &Path, source: &SourceContent) -> Result<bool> {
-    let metadata = std::fs::metadata(path).with_context(|| {
+pub fn source_unchanged(root: &Path, path: &Path, source: &SourceContent) -> Result<bool> {
+    let canonical = validated_source_path(root, path)?;
+    let metadata = fs::metadata(&canonical).with_context(|| {
         format!(
             "No se pudo verificar {} antes de publicarlo",
             path.display()
         )
     })?;
     Ok(metadata.len() == source.size_bytes && metadata.modified().ok() == source.modified)
+}
+
+fn validated_source_path(root: &Path, path: &Path) -> Result<std::path::PathBuf> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("No se pudo verificar {} antes de leerlo", path.display()))?;
+    if is_link_or_reparse_point(&metadata) {
+        return unsafe_path_error(path, "La fuente se convirtio en un enlace");
+    }
+    if !metadata.is_file() {
+        return unsafe_path_error(path, "La fuente ya no es un archivo regular");
+    }
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("No se pudo verificar el root autorizado {}", root.display()))?;
+    let canonical = path.canonicalize().with_context(|| {
+        format!(
+            "No se pudo canonicalizar {} antes de leerlo",
+            path.display()
+        )
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return unsafe_path_error(path, "La fuente queda fuera del root autorizado");
+    }
+    Ok(canonical)
+}
+
+fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+fn unsafe_path_error<T>(path: &Path, message: &str) -> Result<T> {
+    Err(SourceReadError {
+        kind: SourceReadErrorKind::UnsafePath,
+        message: format!("{message}: {}", path.display()),
+    }
+    .into())
 }
 
 fn metadata_changed(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
@@ -314,6 +372,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    fn read_test_source(path: &Path) -> Result<SourceContent> {
+        read_source(path.parent().unwrap(), path)
+    }
+
     struct TestProvider;
 
     impl EmbeddingProvider for TestProvider {
@@ -393,7 +455,7 @@ mod tests {
             .unwrap();
         std::io::Write::write_all(&mut file, b"fn original() -> u8 { 7 }").unwrap();
         let before = std::fs::read(file.path()).unwrap();
-        let content = read_source(file.path()).unwrap();
+        let content = read_test_source(file.path()).unwrap();
         let _ = content_hash(&content.content);
         let _ = chunk_code(1, 1, "src/lib.rs", "rs", "rust", &content.content);
         assert_eq!(std::fs::read(file.path()).unwrap(), before);
@@ -410,7 +472,7 @@ mod tests {
         let mut indexed = Vec::new();
 
         for path in [&invalid, &valid] {
-            match read_source(path) {
+            match read_test_source(path) {
                 Ok(content) => indexed.extend(chunk_code(
                     1,
                     1,
@@ -436,8 +498,8 @@ mod tests {
         std::fs::write(&bom, b"\xef\xbb\xbffn bom() {}").unwrap();
         std::fs::write(&empty, []).unwrap();
 
-        let bom_source = read_source(&bom).unwrap();
-        let empty_source = read_source(&empty).unwrap();
+        let bom_source = read_test_source(&bom).unwrap();
+        let empty_source = read_test_source(&empty).unwrap();
 
         assert_eq!(bom_source.content, "fn bom() {}");
         assert!(chunk_code(1, 1, "empty.rs", "rs", "rust", &empty_source.content).is_empty());
@@ -451,8 +513,8 @@ mod tests {
         std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
         std::fs::write(&binary, b"fn binary() {}\0").unwrap();
 
-        let invalid_error = read_source(&invalid).unwrap_err();
-        let binary_error = read_source(&binary).unwrap_err();
+        let invalid_error = read_test_source(&invalid).unwrap_err();
+        let binary_error = read_test_source(&binary).unwrap_err();
 
         assert_eq!(
             source_read_error_kind(&invalid_error),
@@ -473,7 +535,7 @@ mod tests {
         let file = File::options().write(true).open(&source).unwrap();
         file.set_len(MAX_FILE_BYTES + 1).unwrap();
 
-        let error = read_source(&source).unwrap_err();
+        let error = read_test_source(&source).unwrap_err();
 
         assert!(scanned_size < MAX_FILE_BYTES);
         assert_eq!(
@@ -487,10 +549,49 @@ mod tests {
         let directory = tempfile::tempdir_in("target").unwrap();
         let path = directory.path().join("changed.rs");
         std::fs::write(&path, "fn before() {}").unwrap();
-        let source = read_source(&path).unwrap();
+        let source = read_test_source(&path).unwrap();
         std::fs::write(&path, "fn after_change_is_longer() {}").unwrap();
 
-        assert!(!source_unchanged(&path, &source).unwrap());
+        assert!(!source_unchanged(path.parent().unwrap(), &path, &source).unwrap());
+    }
+
+    #[test]
+    fn rejects_a_source_outside_the_authorized_root_before_opening() {
+        let root = tempfile::tempdir_in("target").unwrap();
+        let outside = tempfile::tempdir_in("target").unwrap();
+        let source = outside.path().join("outside.rs");
+        std::fs::write(&source, "fn outside() {}").unwrap();
+
+        let error = read_source(root.path(), &source).unwrap_err();
+
+        assert_eq!(
+            source_read_error_kind(&error),
+            Some(SourceReadErrorKind::UnsafePath)
+        );
+        assert!(error.to_string().contains("root autorizado"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_source_replaced_by_an_external_symlink_before_opening() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir_in("target").unwrap();
+        let outside = tempfile::tempdir_in("target").unwrap();
+        let source = root.path().join("main.rs");
+        let external = outside.path().join("external.rs");
+        std::fs::write(&source, "fn original() {}").unwrap();
+        std::fs::write(&external, "fn external_secret() {}").unwrap();
+        std::fs::remove_file(&source).unwrap();
+        symlink(&external, &source).unwrap();
+
+        let error = read_source(root.path(), &source).unwrap_err();
+
+        assert_eq!(
+            source_read_error_kind(&error),
+            Some(SourceReadErrorKind::UnsafePath)
+        );
+        assert!(error.to_string().contains("enlace"));
     }
 
     #[test]

@@ -39,10 +39,7 @@ use crate::{
             scan_single_file, verify_missing_code_files,
         },
         search::{resolve_file_scope, search_code_scoped, targets_selected_file},
-        types::{
-            CodeFile, CodeProject, PROJECT_FAILED, PROJECT_PARTIAL, PROJECT_READY,
-            ScanPartialReason, ScanReport,
-        },
+        types::{CodeFile, CodeProject, CodeProjectStatus, ScanPartialReason, ScanReport},
     },
     config::Settings,
     db::Database,
@@ -188,6 +185,32 @@ fn captured_code_file(
             file.id == selected_file_id && file.project_id == project_id && file.error.is_none()
         })
         .cloned()
+}
+
+fn worker_may_update_active_code_project(active: Option<i64>, worker_project_id: i64) -> bool {
+    active.is_none() || active == Some(worker_project_id)
+}
+
+fn code_file_belongs_to_project(file: &CodeFile, project_id: i64) -> bool {
+    file.project_id == project_id
+}
+
+fn ensure_code_index_not_cancelled(cancelled: &AtomicBool, stage: &str) -> Result<()> {
+    if cancelled.load(Ordering::Relaxed) {
+        anyhow::bail!("Indexacion cancelada {stage}");
+    }
+    Ok(())
+}
+
+fn prune_verified_code_files(
+    db: &Database,
+    cancelled: &AtomicBool,
+    project_id: i64,
+    report: &ScanReport,
+    confirmed_missing: &[String],
+) -> Result<()> {
+    ensure_code_index_not_cancelled(cancelled, "antes del pruning")?;
+    db.delete_missing_code_files(project_id, report, confirmed_missing)
 }
 
 fn sources_for_code_scope(
@@ -1460,7 +1483,7 @@ impl KuznorApp {
         thread::spawn(move || {
             let mut indexed_project_id = None;
             let result = (|| -> Result<(i64, String)> {
-                let root = match root_override {
+                let requested_root = match root_override {
                     Some(root) => root,
                     None if single_file => path
                         .parent()
@@ -1468,7 +1491,29 @@ impl KuznorApp {
                         .to_path_buf(),
                     None => path.clone(),
                 };
-                let root = root.canonicalize()?;
+                let known_project_id = path_for_storage(&requested_root)
+                    .ok()
+                    .map(|root_path| db.code_project_id_by_root_path(&root_path))
+                    .transpose()?
+                    .flatten();
+                let root = match requested_root.canonicalize() {
+                    Ok(root) => root,
+                    Err(error) => {
+                        if let Some(project_id) = known_project_id {
+                            indexed_project_id = Some(project_id);
+                            db.transition_code_project_status(
+                                project_id,
+                                CodeProjectStatus::Failed,
+                            )?;
+                        }
+                        return Err(error).with_context(|| {
+                            format!(
+                                "No se pudo abrir el proyecto para actualizarlo: {}",
+                                requested_root.display()
+                            )
+                        });
+                    }
+                };
                 let name = root
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -1510,7 +1555,7 @@ impl KuznorApp {
                     if cancelled.load(Ordering::Relaxed) {
                         anyhow::bail!("Indexacion cancelada");
                     }
-                    match read_source(&file.absolute_path) {
+                    match read_source(&root, &file.absolute_path) {
                         Ok(source) => {
                             if read_bytes.saturating_add(source.size_bytes) > MAX_TOTAL_BYTES {
                                 failed += 1;
@@ -1589,7 +1634,7 @@ impl KuznorApp {
                             if cancelled.load(Ordering::Relaxed) {
                                 anyhow::bail!("Indexacion cancelada");
                             }
-                            match source_unchanged(&file.absolute_path, &source) {
+                            match source_unchanged(&root, &file.absolute_path, &source) {
                                 Ok(true) => {}
                                 Ok(false) => {
                                     failed += 1;
@@ -1636,11 +1681,14 @@ impl KuznorApp {
                 if report.is_complete() {
                     let verification =
                         verify_missing_code_files(&root, &report, existing.keys().cloned());
+                    ensure_code_index_not_cancelled(&cancelled, "antes del pruning")?;
                     if !verification.errors.is_empty() {
                         report.errors.extend(verification.errors);
                         report.mark_partial(ScanPartialReason::TraversalError);
                     } else {
-                        db.delete_missing_code_files(
+                        prune_verified_code_files(
+                            &db,
+                            &cancelled,
                             project_id,
                             &report,
                             &verification.confirmed_missing,
@@ -1649,9 +1697,10 @@ impl KuznorApp {
                 }
                 let complete = report.is_complete();
                 if complete {
-                    db.set_code_project_status(project_id, PROJECT_READY)?;
+                    ensure_code_index_not_cancelled(&cancelled, "antes de publicar el resultado")?;
+                    db.transition_code_project_status(project_id, CodeProjectStatus::Ready)?;
                 } else {
-                    db.set_code_project_status(project_id, PROJECT_PARTIAL)?;
+                    db.transition_code_project_status(project_id, CodeProjectStatus::Partial)?;
                 }
                 if processes
                     .lock()
@@ -1688,13 +1737,15 @@ impl KuznorApp {
             })();
             if cancelled.load(Ordering::Relaxed) {
                 if let Some(project_id) = indexed_project_id {
-                    let _ = db.set_code_project_status(project_id, PROJECT_PARTIAL);
+                    let _ =
+                        db.transition_code_project_status(project_id, CodeProjectStatus::Partial);
                 }
                 let _ = tx.send(Event::CodeIndexCancelled(indexed_project_id));
             } else {
                 if result.is_err() {
                     if let Some(project_id) = indexed_project_id {
-                        let _ = db.set_code_project_status(project_id, PROJECT_FAILED);
+                        let _ = db
+                            .transition_code_project_status(project_id, CodeProjectStatus::Failed);
                     }
                 }
                 let _ = tx.send(Event::CodeIndexFinished(
@@ -1744,6 +1795,10 @@ impl KuznorApp {
                 Some("El archivo seleccionado ya no pertenece al proyecto activo.".into());
             return;
         };
+        if !code_file_belongs_to_project(file, project_id) {
+            self.notice = Some("El archivo seleccionado no pertenece al proyecto activo.".into());
+            return;
+        }
         let root = PathBuf::from(&project.root_path);
         let candidate = root.join(&file.relative_path);
         let root_canonical = match root.canonicalize() {
@@ -1946,13 +2001,20 @@ impl KuznorApp {
                     self.code_index_cancel = None;
                     match result {
                         Ok((project_id, status)) => {
+                            let worker_updates_active = worker_may_update_active_code_project(
+                                self.active_code_project,
+                                project_id,
+                            );
                             if self.active_code_project.is_none() {
                                 self.active_code_project = Some(project_id);
                             }
                             self.code_status = status;
-                            let _ = self
-                                .db
-                                .save_setting("active_code_project_id", &project_id.to_string());
+                            if worker_updates_active {
+                                let _ = self.db.save_setting(
+                                    "active_code_project_id",
+                                    &project_id.to_string(),
+                                );
+                            }
                             if let Err(error) = self.reload() {
                                 self.error(error);
                             }
@@ -1966,9 +2028,7 @@ impl KuznorApp {
                 Event::CodeIndexCancelled(project_id) => {
                     self.code_indexing = false;
                     self.code_index_cancel = None;
-                    if let Some(project_id) = project_id {
-                        self.active_code_project = Some(project_id);
-                    }
+                    let _ = project_id;
                     self.code_status = "Indexacion cancelada".into();
                     self.notice = Some(
                         "Indexacion cancelada. El proyecto quedo marcado como incompleto.".into(),
@@ -2864,14 +2924,15 @@ mod tests {
     use super::{
         APP_DATA_DIRECTORY, DATABASE_FILE, View, active_library_for_sidebar, automatic_title,
         captured_code_file, chat_status_after_health, chat_view_for_profile,
-        copy_legacy_database_snapshot, database_path_in, generation_belongs_to_chat,
-        migrate_legacy_database, sources_for_code_scope, sources_for_library, startup_view,
+        code_file_belongs_to_project, copy_legacy_database_snapshot, database_path_in,
+        ensure_code_index_not_cancelled, generation_belongs_to_chat, migrate_legacy_database,
+        prune_verified_code_files, sources_for_code_scope, sources_for_library, startup_view,
         status_after_health, status_after_request, user_data_directory_from_local_appdata,
-        valid_selected_code_file,
+        valid_selected_code_file, worker_may_update_active_code_project,
     };
     use crate::{
         ai::process::ServiceStatus,
-        code::types::CodeFile,
+        code::types::{CodeChunk, CodeFile, ScanReport},
         db::Database,
         models::{Profile, Source},
     };
@@ -2879,6 +2940,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
+        sync::atomic::AtomicBool,
     };
 
     #[test]
@@ -3373,5 +3435,77 @@ mod tests {
         assert_ne!(generation_chat, other_chat);
         assert!(!generation_belongs_to_chat(other_chat, generation_chat));
         assert!(generation_belongs_to_chat(generation_chat, generation_chat));
+    }
+
+    #[test]
+    fn cancelled_code_worker_never_authorizes_pruning_or_ready_publication() {
+        let cancelled = AtomicBool::new(true);
+        assert!(ensure_code_index_not_cancelled(&cancelled, "antes del pruning").is_err());
+        assert!(ensure_code_index_not_cancelled(&cancelled, "antes de publicar").is_err());
+    }
+
+    #[test]
+    fn cancellation_after_verification_keeps_missing_file_indexed() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let db = Database::open(directory.path().join("cancel-before-prune.db")).unwrap();
+        let project = db.upsert_code_project("A", "C:/a").unwrap();
+        db.replace_code_file_index(
+            project,
+            "missing.rs",
+            "hash",
+            "rs",
+            "rust",
+            1,
+            &[CodeChunk {
+                id: 0,
+                project_id: project,
+                file_id: 0,
+                relative_path: "missing.rs".into(),
+                extension: "rs".into(),
+                language: "rust".into(),
+                chunk_index: 0,
+                line_start: 1,
+                line_end: 1,
+                content: "fn old() {}".into(),
+                embedding: vec![1.0],
+            }],
+        )
+        .unwrap();
+        let cancelled = AtomicBool::new(true);
+
+        assert!(
+            prune_verified_code_files(
+                &db,
+                &cancelled,
+                project,
+                &ScanReport::complete(),
+                &["missing.rs".into()],
+            )
+            .is_err()
+        );
+        assert_eq!(db.list_code_files(project).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn code_worker_does_not_restore_or_persist_another_project_selection() {
+        assert!(!worker_may_update_active_code_project(Some(2), 1));
+        assert!(worker_may_update_active_code_project(Some(1), 1));
+        assert!(worker_may_update_active_code_project(None, 1));
+    }
+
+    #[test]
+    fn selected_file_from_another_project_is_rejected_before_refresh() {
+        let file = CodeFile {
+            id: 7,
+            project_id: 2,
+            relative_path: "main.rs".into(),
+            hash: "hash".into(),
+            extension: "rs".into(),
+            language: "rust".into(),
+            size_bytes: 1,
+            error: None,
+        };
+        assert!(!code_file_belongs_to_project(&file, 1));
+        assert!(code_file_belongs_to_project(&file, 2));
     }
 }

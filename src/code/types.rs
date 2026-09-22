@@ -3,6 +3,46 @@ use std::path::PathBuf;
 pub const PROJECT_READY: &str = "ready";
 pub const PROJECT_PARTIAL: &str = "partial";
 pub const PROJECT_FAILED: &str = "failed";
+pub const PROJECT_INDEXING: &str = "indexing";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeProjectStatus {
+    Indexing,
+    Ready,
+    Partial,
+    Failed,
+}
+
+impl CodeProjectStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Indexing => PROJECT_INDEXING,
+            Self::Ready => PROJECT_READY,
+            Self::Partial => PROJECT_PARTIAL,
+            Self::Failed => PROJECT_FAILED,
+        }
+    }
+
+    pub fn parse(status: &str) -> Option<Self> {
+        match status {
+            PROJECT_INDEXING | "escaneando" => Some(Self::Indexing),
+            PROJECT_READY | "listo" => Some(Self::Ready),
+            PROJECT_PARTIAL | "cancelled" => Some(Self::Partial),
+            PROJECT_FAILED => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        match (self, next) {
+            (_, Self::Indexing) => true,
+            (Self::Indexing, Self::Ready | Self::Partial | Self::Failed) => true,
+            (Self::Ready, Self::Partial | Self::Failed) => true,
+            (Self::Partial, Self::Failed) | (Self::Failed, Self::Failed) => true,
+            _ => false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeProject {

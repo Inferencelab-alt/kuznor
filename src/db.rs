@@ -9,7 +9,7 @@ use chrono::Utc;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use crate::{
-    code::types::{CodeChunk, CodeFile, CodeProject, ScanReport},
+    code::types::{CodeChunk, CodeFile, CodeProject, CodeProjectStatus, ScanReport},
     models::{Chat, Chunk, Document, Library, Message, Profile, Source},
 };
 
@@ -579,8 +579,8 @@ impl Database {
         let conn = self.connection()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO code_projects(name,root_path,status,last_opened) VALUES(?1,?2,'indexing',?3) ON CONFLICT(root_path) DO UPDATE SET name=excluded.name,status='indexing',last_opened=excluded.last_opened",
-            params![name, root_path, now],
+            "INSERT INTO code_projects(name,root_path,status,last_opened) VALUES(?1,?2,?3,?4) ON CONFLICT(root_path) DO UPDATE SET name=excluded.name,status=excluded.status,last_opened=excluded.last_opened",
+            params![name, root_path, CodeProjectStatus::Indexing.as_str(), now],
         )?;
         conn.query_row(
             "SELECT id FROM code_projects WHERE root_path=?1",
@@ -588,6 +588,17 @@ impl Database {
             |row| row.get(0),
         )
         .map_err(Into::into)
+    }
+
+    pub fn code_project_id_by_root_path(&self, root_path: &str) -> Result<Option<i64>> {
+        self.connection()?
+            .query_row(
+                "SELECT id FROM code_projects WHERE root_path=?1",
+                [root_path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn list_code_projects(&self) -> Result<Vec<CodeProject>> {
@@ -613,11 +624,35 @@ impl Database {
         Ok(())
     }
 
-    pub fn set_code_project_status(&self, project_id: i64, status: &str) -> Result<()> {
-        self.connection()?.execute(
+    pub fn transition_code_project_status(
+        &self,
+        project_id: i64,
+        next: CodeProjectStatus,
+    ) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let current: String = transaction
+            .query_row(
+                "SELECT status FROM code_projects WHERE id=?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .context("El proyecto de codigo ya no existe")?;
+        let current = CodeProjectStatus::parse(&current)
+            .with_context(|| format!("Estado de proyecto de codigo no reconocido: {current}"))?;
+        if !current.can_transition_to(next) {
+            anyhow::bail!(
+                "Transicion de estado de codigo no permitida: {} -> {}",
+                current.as_str(),
+                next.as_str()
+            );
+        }
+        transaction.execute(
             "UPDATE code_projects SET status=?1,last_opened=?2 WHERE id=?3",
-            params![status, Utc::now().to_rfc3339(), project_id],
+            params![next.as_str(), Utc::now().to_rfc3339(), project_id],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1360,7 +1395,9 @@ mod tests {
             database.list_code_files(project).unwrap()[0].hash,
             "old-hash"
         );
-        database.set_code_project_status(project, "ready").unwrap();
+        database
+            .transition_code_project_status(project, CodeProjectStatus::Ready)
+            .unwrap();
         assert_eq!(database.code_chunks(project).unwrap()[0].content, "old");
     }
 
@@ -1382,7 +1419,7 @@ mod tests {
             .unwrap();
 
         database
-            .set_code_project_status(project, crate::code::types::PROJECT_FAILED)
+            .transition_code_project_status(project, CodeProjectStatus::Failed)
             .unwrap();
 
         assert_eq!(
@@ -1399,6 +1436,46 @@ mod tests {
             database.list_code_projects().unwrap()[0].status,
             crate::code::types::PROJECT_FAILED
         );
+        assert!(
+            database
+                .transition_code_project_status(project, CodeProjectStatus::Ready)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unavailable_refresh_marks_ready_project_failed_without_erasing_its_index() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let database = Database::open(directory.path().join("missing-root.db")).unwrap();
+        let project = database.upsert_code_project("A", "C:/missing").unwrap();
+        database
+            .replace_code_file_index(
+                project,
+                "main.rs",
+                "old-hash",
+                "rs",
+                "rust",
+                1,
+                &[code_chunk(project, "old")],
+            )
+            .unwrap();
+        database
+            .transition_code_project_status(project, CodeProjectStatus::Ready)
+            .unwrap();
+
+        database
+            .transition_code_project_status(project, CodeProjectStatus::Failed)
+            .unwrap();
+
+        assert_eq!(
+            database.list_code_files(project).unwrap()[0].hash,
+            "old-hash"
+        );
+        assert_eq!(
+            database.list_code_projects().unwrap()[0].status,
+            crate::code::types::PROJECT_FAILED
+        );
+        assert!(database.code_chunks(project).unwrap().is_empty());
     }
 
     #[test]
@@ -1407,14 +1484,34 @@ mod tests {
         let database = Database::open(directory.path().join("project-statuses.db")).unwrap();
         let project = database.upsert_code_project("A", "C:/a").unwrap();
 
-        for status in [
-            crate::code::types::PROJECT_READY,
-            crate::code::types::PROJECT_PARTIAL,
-            crate::code::types::PROJECT_FAILED,
-        ] {
-            database.set_code_project_status(project, status).unwrap();
-            assert_eq!(database.list_code_projects().unwrap()[0].status, status);
-        }
+        database
+            .transition_code_project_status(project, CodeProjectStatus::Ready)
+            .unwrap();
+        assert_eq!(
+            database.list_code_projects().unwrap()[0].status,
+            crate::code::types::PROJECT_READY
+        );
+        assert!(
+            database
+                .transition_code_project_status(project, CodeProjectStatus::Partial)
+                .is_ok()
+        );
+        assert_eq!(
+            database.list_code_projects().unwrap()[0].status,
+            crate::code::types::PROJECT_PARTIAL
+        );
+        assert!(
+            database
+                .transition_code_project_status(project, CodeProjectStatus::Ready)
+                .is_err()
+        );
+        database
+            .transition_code_project_status(project, CodeProjectStatus::Failed)
+            .unwrap();
+        assert_eq!(
+            database.list_code_projects().unwrap()[0].status,
+            crate::code::types::PROJECT_FAILED
+        );
     }
 
     #[test]
@@ -1667,7 +1764,9 @@ mod tests {
         let file = database
             .replace_code_file_index(project, "main.rs", "hash", "rs", "rust", 1, &[])
             .unwrap();
-        database.set_code_project_status(project, "ready").unwrap();
+        database
+            .transition_code_project_status(project, CodeProjectStatus::Ready)
+            .unwrap();
         Connection::open(&path)
             .unwrap()
             .execute(
@@ -2023,8 +2122,10 @@ mod tests {
                 &[make_chunk(second, 0, "app.py")],
             )
             .unwrap();
-        db.set_code_project_status(first, "ready").unwrap();
-        db.set_code_project_status(second, "ready").unwrap();
+        db.transition_code_project_status(first, CodeProjectStatus::Ready)
+            .unwrap();
+        db.transition_code_project_status(second, CodeProjectStatus::Ready)
+            .unwrap();
 
         let first_chunks = db.code_chunks(first).unwrap();
         assert_eq!(first_chunks.len(), 1);
@@ -2065,9 +2166,15 @@ mod tests {
             .unwrap();
         assert_eq!(db.mark_interrupted_code_projects().unwrap(), 1);
         assert!(db.code_chunks(project).unwrap().is_empty());
-        db.set_code_project_status(project, "cancelled").unwrap();
+        assert!(
+            db.transition_code_project_status(project, CodeProjectStatus::Ready)
+                .is_err()
+        );
         assert!(db.code_chunks(project).unwrap().is_empty());
-        db.set_code_project_status(project, "ready").unwrap();
+        db.upsert_code_project("Parcial", "C:/projects/parcial")
+            .unwrap();
+        db.transition_code_project_status(project, CodeProjectStatus::Ready)
+            .unwrap();
         assert_eq!(db.code_chunks(project).unwrap().len(), 1);
     }
 
