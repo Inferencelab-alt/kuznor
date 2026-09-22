@@ -11,6 +11,7 @@ pub enum LibraryAction {
     Rename(i64),
     Delete(i64),
     AddDocument,
+    CancelIndexing,
     DeleteDocument(i64),
     Reindex(i64),
 }
@@ -21,6 +22,7 @@ pub fn show(
     selected: Option<i64>,
     documents: &[Document],
     new_name: &mut String,
+    indexing: bool,
 ) -> Option<LibraryAction> {
     let mut action = None;
     ui.horizontal_wrapped(|ui| {
@@ -82,8 +84,11 @@ pub fn show(
         theme::surface_frame().show(&mut columns[1], |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.strong("Documentos");
-                if selected.is_some() && ui.button("Agregar archivo").clicked() {
+                if selected.is_some() && !indexing && ui.button("Agregar archivo").clicked() {
                     action = Some(LibraryAction::AddDocument);
+                }
+                if indexing && ui.button("Cancelar indexacion").clicked() {
+                    action = Some(LibraryAction::CancelIndexing);
                 }
             });
             ui.add_space(4.0);

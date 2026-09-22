@@ -257,10 +257,6 @@ pub fn parse_chat_response(body: &str) -> Result<String> {
         .context("La respuesta no contiene opciones")
 }
 
-pub fn embeddings(settings: &Settings, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-    embeddings_with_timeout(settings, inputs, Duration::from_secs(300))
-}
-
 pub fn embeddings_with_timeout(
     settings: &Settings,
     inputs: &[String],

@@ -47,10 +47,10 @@ use crate::{
     models::{Chat, Document, Library, Message, Profile, Source},
     performance::{self, ProcessSampler},
     rag::{
-        chunking::chunk_document,
+        chunking::chunk_document_limited,
         embeddings::{
             EmbeddingProvider, NomicLocalProvider, embed_chunks_with_retry,
-            prepare_embedding_chunks,
+            prepare_embedding_chunks_limited,
         },
         search::{
             build_library_overview, global_literal_terms, lexical_matches, mentioned_documents,
@@ -99,6 +99,7 @@ enum Event {
     ChatCancelled,
     IndexProgress(String),
     IndexFinished(Result<String, String>),
+    IndexCancelled,
     CodeIndexProgress(String),
     CodeIndexFinished(Result<(i64, String), String>),
     CodeIndexCancelled(Option<i64>),
@@ -492,6 +493,7 @@ pub struct KuznorApp {
     performance_sampled_at: Instant,
     performance_metrics: Option<String>,
     indexing: bool,
+    document_index_cancel: Option<Arc<AtomicBool>>,
     chat_status: ServiceStatus,
     embedding_status: ServiceStatus,
     health_check_in_flight: bool,
@@ -600,6 +602,7 @@ impl KuznorApp {
             performance_sampled_at: Instant::now(),
             performance_metrics: None,
             indexing: false,
+            document_index_cancel: None,
             chat_status: ServiceStatus::Starting,
             embedding_status: ServiceStatus::Starting,
             health_check_in_flight: false,
@@ -990,6 +993,7 @@ impl KuznorApp {
                         tx.send(Event::EmbeddingStatus(ServiceStatus::Busy)).ok();
                         let provider = NomicLocalProvider {
                             settings: &settings,
+                            timeout: Duration::from_secs(300),
                         };
                         let query_embedding = provider.embed_query(&question)?;
                         let file_scope =
@@ -1086,6 +1090,7 @@ impl KuznorApp {
                                 tx.send(Event::EmbeddingStatus(ServiceStatus::Busy)).ok();
                                 let provider = NomicLocalProvider {
                                     settings: &settings,
+                                    timeout: Duration::from_secs(300),
                                 };
                                 let query_embedding = provider.embed_query(&question)?;
                                 let mentioned = mentioned_documents(&library_chunks, &question);
@@ -1368,98 +1373,129 @@ impl KuznorApp {
             return;
         }
         self.indexing = true;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.document_index_cancel = Some(cancelled.clone());
         let tx = self.events_tx.clone();
         let db = self.db.clone();
         let settings = self.settings.clone();
         let processes = self.processes.clone();
         thread::spawn(move || {
             let result = (|| -> Result<String> {
+                let deadline = Instant::now() + documents::DOCUMENT_PROCESSING_BUDGET;
                 tx.send(Event::IndexProgress("Extrayendo texto...".into()))
                     .ok();
-                let hash = documents::file_hash(&path)?;
-                let name = path
+                documents::ensure_active(&cancelled, deadline)?;
+                let document = documents::validate_document_path(&path)?;
+                let hash = documents::streaming_file_hash(&document, &cancelled, deadline)?;
+                documents::ensure_active(&cancelled, deadline)?;
+                let name = document
+                    .path()
                     .file_name()
                     .and_then(|v| v.to_str())
                     .context("Nombre de archivo invalido")?
                     .to_owned();
-                let kind = path
-                    .extension()
-                    .and_then(|v| v.to_str())
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                let parsed = documents::parse(&path)?;
-                let document_id = if let Some(id) = reindex_id {
-                    db.replace_document(id, &path.to_string_lossy(), &name, &kind)?;
-                    id
-                } else if db.document_by_hash(library_id, &hash)?.is_some() {
-                    anyhow::bail!(
-                        "Este documento ya existe en la biblioteca. Usa Reindexar para reemplazar sus chunks."
-                    );
-                } else {
-                    db.create_document(library_id, &name, &path.to_string_lossy(), &hash, &kind)?
-                };
-                let work = (|| -> Result<usize> {
-                    tx.send(Event::IndexProgress("Dividiendo documento...".into()))
-                        .ok();
-                    let mut chunks =
-                        chunk_document(&parsed, settings.chunk_size, settings.chunk_overlap);
-                    if chunks.is_empty() {
-                        anyhow::bail!("El documento no produjo fragmentos utiles.");
-                    }
-                    for chunk in &mut chunks {
-                        chunk.document_id = document_id;
-                    }
-                    chunks = prepare_embedding_chunks(chunks);
-                    tx.send(Event::EmbeddingStatus(ServiceStatus::Starting))
-                        .ok();
-                    processes
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("Gestor de procesos bloqueado"))?
-                        .ensure(ServiceKind::Embedding, &settings)?;
-                    tx.send(Event::EmbeddingStatus(ServiceStatus::Busy)).ok();
-                    let total_chunks = chunks.len();
-                    let mut embedded_chunks = Vec::with_capacity(total_chunks);
-                    for (batch_index, batch) in chunks.chunks(8).enumerate() {
-                        let done = (batch_index * 8).min(total_chunks) + batch.len();
-                        tx.send(Event::IndexProgress(format!(
-                            "Generando embeddings {done}/{}...",
-                            total_chunks
-                        )))
-                        .ok();
-                        let provider = NomicLocalProvider {
-                            settings: &settings,
-                        };
-                        embedded_chunks.extend(embed_chunks_with_retry(&provider, batch.to_vec())?);
-                    }
-                    for (chunk_index, chunk) in embedded_chunks.iter_mut().enumerate() {
-                        chunk.chunk_index = chunk_index;
-                    }
-                    tx.send(Event::IndexProgress("Guardando...".into())).ok();
-                    db.save_chunks(document_id, &embedded_chunks)?;
-                    Ok(embedded_chunks.len())
-                })();
-                if let Err(e) = &work {
-                    db.set_document_status(document_id, "error", Some(&e.to_string()))
-                        .ok();
+                let kind = document.kind().to_owned();
+                let parsed = documents::parse_validated_document(&document, &cancelled, deadline)?;
+                tx.send(Event::IndexProgress("Dividiendo documento...".into()))
+                    .ok();
+                let mut chunks = chunk_document_limited(
+                    &parsed,
+                    settings.chunk_size,
+                    settings.chunk_overlap,
+                    documents::MAX_CHUNK_BYTES,
+                    documents::MAX_DOCUMENT_CHUNKS,
+                    &cancelled,
+                    deadline,
+                )?;
+                if chunks.is_empty() {
+                    anyhow::bail!("El documento no produjo fragmentos utiles.");
                 }
-                if processes
+                for chunk in &mut chunks {
+                    chunk.document_name = parsed.title.clone();
+                }
+                chunks = prepare_embedding_chunks_limited(chunks, documents::MAX_DOCUMENT_CHUNKS)?;
+                documents::ensure_active(&cancelled, deadline)?;
+                tx.send(Event::EmbeddingStatus(ServiceStatus::Starting))
+                    .ok();
+                processes
                     .lock()
-                    .map(|p| p.owns(ServiceKind::Embedding))
-                    .unwrap_or(false)
+                    .map_err(|_| anyhow::anyhow!("Gestor de procesos bloqueado"))?
+                    .ensure(ServiceKind::Embedding, &settings)
+                    .context("Embeddings no disponibles")?;
+                tx.send(Event::EmbeddingStatus(ServiceStatus::Busy)).ok();
+                let total_chunks = chunks.len();
+                let mut embedded_chunks = Vec::with_capacity(total_chunks);
+                for (batch_index, batch) in
+                    chunks.chunks(documents::EMBEDDING_BATCH_SIZE).enumerate()
                 {
-                    let _ = processes
-                        .lock()
-                        .map(|mut p| p.stop_owned(ServiceKind::Embedding));
-                    tx.send(Event::EmbeddingStatus(ServiceStatus::Disconnected))
-                        .ok();
-                } else {
-                    tx.send(Event::EmbeddingStatus(ServiceStatus::Ready)).ok();
+                    documents::ensure_active(&cancelled, deadline)?;
+                    let done = (batch_index * documents::EMBEDDING_BATCH_SIZE).min(total_chunks)
+                        + batch.len();
+                    tx.send(Event::IndexProgress(format!(
+                        "Generando embeddings {done}/{total_chunks}..."
+                    )))
+                    .ok();
+                    let provider = NomicLocalProvider {
+                        settings: &settings,
+                        timeout: Duration::from_secs(30),
+                    };
+                    let embedded = embed_chunks_with_retry(&provider, batch.to_vec())
+                        .context("Embeddings no disponibles")?;
+                    documents::ensure_active(&cancelled, deadline)?;
+                    if embedded_chunks.len() + embedded.len() > documents::MAX_DOCUMENT_CHUNKS {
+                        anyhow::bail!(
+                            "El documento supera el limite de {} embeddings.",
+                            documents::MAX_DOCUMENT_CHUNKS
+                        );
+                    }
+                    embedded_chunks.extend(embedded);
                 }
-                let count = work?;
+                for (chunk_index, chunk) in embedded_chunks.iter_mut().enumerate() {
+                    chunk.chunk_index = chunk_index;
+                }
+                documents::ensure_active(&cancelled, deadline)?;
+                document.revalidate()?;
+                tx.send(Event::IndexProgress("Guardando...".into())).ok();
+                documents::ensure_active(&cancelled, deadline)?;
+                db.publish_document_index(
+                    library_id,
+                    reindex_id,
+                    &name,
+                    document.persistent_path(),
+                    &hash,
+                    &kind,
+                    &embedded_chunks,
+                )
+                .context("Fallo SQLite al publicar el documento")?;
+                let count = embedded_chunks.len();
                 Ok(format!("Documento listo: {name} ({count} fragmentos)."))
             })();
+            if processes
+                .lock()
+                .map(|p| p.owns(ServiceKind::Embedding))
+                .unwrap_or(false)
+            {
+                let _ = processes
+                    .lock()
+                    .map(|mut p| p.stop_owned(ServiceKind::Embedding));
+                tx.send(Event::EmbeddingStatus(ServiceStatus::Disconnected))
+                    .ok();
+            } else {
+                tx.send(Event::EmbeddingStatus(ServiceStatus::Ready)).ok();
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                let _ = tx.send(Event::IndexCancelled);
+                return;
+            }
             let _ = tx.send(Event::IndexFinished(result.map_err(|e| e.to_string())));
         });
+    }
+
+    fn cancel_document_indexing(&mut self) {
+        if let Some(cancelled) = &self.document_index_cancel {
+            cancelled.store(true, Ordering::Relaxed);
+            self.progress = Some("Cancelando indexacion de documento...".into());
+        }
     }
 
     fn index_code_path(
@@ -1986,11 +2022,24 @@ impl KuznorApp {
                 Event::IndexProgress(p) => self.progress = Some(p),
                 Event::IndexFinished(result) => {
                     self.indexing = false;
+                    self.document_index_cancel = None;
                     self.progress = None;
                     match result {
                         Ok(message) => self.notice = Some(message),
                         Err(e) => self.error(e),
                     }
+                    if let Err(e) = self.reload() {
+                        self.error(e);
+                    }
+                }
+                Event::IndexCancelled => {
+                    self.indexing = false;
+                    self.document_index_cancel = None;
+                    self.progress = None;
+                    self.notice = Some(
+                        "Indexacion de documento cancelada. No se publico ningun cambio parcial."
+                            .into(),
+                    );
                     if let Err(e) = self.reload() {
                         self.error(e);
                     }
@@ -2549,6 +2598,7 @@ impl eframe::App for KuznorApp {
                             self.active_library_id,
                             &self.documents,
                             &mut self.new_name,
+                            self.indexing,
                         ) {
                             use ui::libraries::LibraryAction::*;
                             match action {
@@ -2592,6 +2642,7 @@ impl eframe::App for KuznorApp {
                                         self.index_path(id, path, None);
                                     }
                                 }
+                                CancelIndexing => self.cancel_document_indexing(),
                                 DeleteDocument(id) => {
                                     if let Err(e) = self.db.delete_document(id) {
                                         self.error(e)
@@ -2852,6 +2903,9 @@ impl Drop for KuznorApp {
             cancelled.store(true, Ordering::Relaxed);
         }
         if let Some(cancelled) = &self.code_index_cancel {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        if let Some(cancelled) = &self.document_index_cancel {
             cancelled.store(true, Ordering::Relaxed);
         }
     }

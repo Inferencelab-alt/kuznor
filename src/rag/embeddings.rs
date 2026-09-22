@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Result, anyhow};
 
 use crate::{ai::client, config::Settings, models::Chunk};
@@ -11,6 +13,7 @@ pub trait EmbeddingProvider {
 
 pub struct NomicLocalProvider<'a> {
     pub settings: &'a Settings,
+    pub timeout: Duration,
 }
 
 impl EmbeddingProvider for NomicLocalProvider<'_> {
@@ -19,20 +22,40 @@ impl EmbeddingProvider for NomicLocalProvider<'_> {
             .iter()
             .map(|text| format!("search_document: {text}"))
             .collect::<Vec<_>>();
-        client::embeddings(self.settings, &inputs)
+        client::embeddings_with_timeout(self.settings, &inputs, self.timeout)
     }
 
     fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
         let inputs = vec![format!("search_query: {query}")];
-        Ok(client::embeddings(self.settings, &inputs)?.remove(0))
+        Ok(client::embeddings_with_timeout(self.settings, &inputs, self.timeout)?.remove(0))
     }
 }
 
+#[cfg(test)]
 pub fn prepare_embedding_chunks(chunks: Vec<Chunk>) -> Vec<Chunk> {
     chunks
         .into_iter()
         .flat_map(|chunk| split_chunk_for_embedding(chunk, SAFE_EMBEDDING_TOKENS))
         .collect()
+}
+
+pub fn prepare_embedding_chunks_limited(
+    chunks: Vec<Chunk>,
+    max_chunks: usize,
+) -> Result<Vec<Chunk>> {
+    let mut prepared = Vec::new();
+    for chunk in chunks {
+        for part in split_chunk_for_embedding(chunk, SAFE_EMBEDDING_TOKENS) {
+            if prepared.len() >= max_chunks {
+                anyhow::bail!(
+                    "El documento supera el limite de {} embeddings.",
+                    max_chunks
+                );
+            }
+            prepared.push(part);
+        }
+    }
+    Ok(prepared)
 }
 
 pub fn embed_chunks_with_retry<P: EmbeddingProvider>(
@@ -197,6 +220,13 @@ mod tests {
                 .all(|item| item.document_id == 3 && item.page_number == Some(8))
         );
         assert_eq!(chunks[0].chunk_index, 4);
+    }
+
+    #[test]
+    fn embedding_preparation_enforces_document_limit() {
+        let error = prepare_embedding_chunks_limited(vec![chunk(&"palabra ".repeat(1_200))], 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("limite de 1 embeddings"));
     }
 
     struct RejectingProvider;

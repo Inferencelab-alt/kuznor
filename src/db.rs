@@ -21,6 +21,27 @@ fn valid_library_name(name: &str) -> Result<&str> {
     Ok(name)
 }
 
+fn insert_document_chunks(
+    transaction: &rusqlite::Transaction<'_>,
+    document_id: i64,
+    chunks: &[Chunk],
+) -> Result<()> {
+    let mut statement = transaction.prepare(
+        "INSERT INTO document_chunks(document_id,chunk_index,content,page_number,section,embedding) VALUES(?1,?2,?3,?4,?5,?6)",
+    )?;
+    for chunk in chunks {
+        statement.execute(params![
+            document_id,
+            chunk.chunk_index as i64,
+            chunk.content,
+            chunk.page_number,
+            chunk.section,
+            embedding_to_bytes(&chunk.embedding)
+        ])?;
+    }
+    Ok(())
+}
+
 const CURRENT_SCHEMA_VERSION: i32 = 1;
 
 const CREATE_TABLES_V1: &str = r#"
@@ -463,11 +484,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn document_by_hash(&self, library_id: i64, hash: &str) -> Result<Option<Document>> {
-        let conn = self.connection()?;
-        conn.query_row("SELECT id,library_id,name,original_path,hash,file_type,status,created_at,error FROM documents WHERE library_id=?1 AND hash=?2", params![library_id,hash], document_row).optional().map_err(Into::into)
-    }
-
+    #[cfg(test)]
     pub fn create_document(
         &self,
         library_id: i64,
@@ -481,13 +498,68 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn replace_document(&self, id: i64, path: &str, name: &str, kind: &str) -> Result<()> {
+    pub fn publish_document_index(
+        &self,
+        library_id: i64,
+        reindex_id: Option<i64>,
+        name: &str,
+        path: &str,
+        hash: &str,
+        kind: &str,
+        chunks: &[Chunk],
+    ) -> Result<i64> {
         let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM document_chunks WHERE document_id=?1", [id])?;
-        tx.execute("UPDATE documents SET original_path=?1,name=?2,file_type=?3,status='indexando',error=NULL WHERE id=?4",params![path,name,kind,id])?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let document_id = if let Some(document_id) = reindex_id {
+            let owner = tx
+                .query_row(
+                    "SELECT library_id FROM documents WHERE id=?1",
+                    [document_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if owner != Some(library_id) {
+                anyhow::bail!("El documento a reindexar ya no pertenece a esta biblioteca");
+            }
+            let duplicate = tx
+                .query_row(
+                    "SELECT id FROM documents WHERE library_id=?1 AND hash=?2 AND id<>?3",
+                    params![library_id, hash, document_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if duplicate.is_some() {
+                anyhow::bail!("Este documento ya existe en la biblioteca.");
+            }
+            tx.execute(
+                "UPDATE documents SET original_path=?1,name=?2,hash=?3,file_type=?4,status='listo',error=NULL WHERE id=?5 AND library_id=?6",
+                params![path, name, hash, kind, document_id, library_id],
+            )?;
+            tx.execute(
+                "DELETE FROM document_chunks WHERE document_id=?1",
+                [document_id],
+            )?;
+            document_id
+        } else {
+            let duplicate = tx
+                .query_row(
+                    "SELECT id FROM documents WHERE library_id=?1 AND hash=?2",
+                    params![library_id, hash],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if duplicate.is_some() {
+                anyhow::bail!("Este documento ya existe en la biblioteca.");
+            }
+            tx.execute(
+                "INSERT INTO documents(library_id,name,original_path,hash,file_type,status,created_at,error) VALUES(?1,?2,?3,?4,?5,'listo',?6,NULL)",
+                params![library_id, name, path, hash, kind, Utc::now().to_rfc3339()],
+            )?;
+            tx.last_insert_rowid()
+        };
+        insert_document_chunks(&tx, document_id, chunks)?;
         tx.commit()?;
-        Ok(())
+        Ok(document_id)
     }
 
     pub fn list_documents(&self, library_id: i64) -> Result<Vec<Document>> {
@@ -503,14 +575,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn set_document_status(&self, id: i64, status: &str, error: Option<&str>) -> Result<()> {
-        self.connection()?.execute(
-            "UPDATE documents SET status=?1,error=?2 WHERE id=?3",
-            params![status, error, id],
-        )?;
-        Ok(())
-    }
-
+    #[cfg(test)]
     pub fn save_chunks(&self, document_id: i64, chunks: &[Chunk]) -> Result<()> {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
@@ -518,19 +583,7 @@ impl Database {
             "DELETE FROM document_chunks WHERE document_id=?1",
             [document_id],
         )?;
-        {
-            let mut stmt=tx.prepare("INSERT INTO document_chunks(document_id,chunk_index,content,page_number,section,embedding) VALUES(?1,?2,?3,?4,?5,?6)")?;
-            for chunk in chunks {
-                stmt.execute(params![
-                    document_id,
-                    chunk.chunk_index as i64,
-                    chunk.content,
-                    chunk.page_number,
-                    chunk.section,
-                    embedding_to_bytes(&chunk.embedding)
-                ])?;
-            }
-        }
+        insert_document_chunks(&tx, document_id, chunks)?;
         tx.execute(
             "UPDATE documents SET status='listo',error=NULL WHERE id=?1",
             [document_id],
@@ -2223,6 +2276,169 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(original_file).unwrap(),
             "fn main() {}\n"
+        );
+    }
+
+    fn document_chunk(content: &str) -> Chunk {
+        Chunk {
+            id: 0,
+            document_id: 0,
+            document_name: "manual.txt".into(),
+            chunk_index: 0,
+            content: content.into(),
+            page_number: None,
+            section: None,
+            embedding: vec![1.0, 0.0],
+        }
+    }
+
+    #[test]
+    fn document_publication_replaces_a_ready_index_atomically() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let db = Database::open(directory.path().join("atomic-document.db")).unwrap();
+        let library = db.create_library("Biblioteca").unwrap();
+        let id = db
+            .publish_document_index(
+                library,
+                None,
+                "manual.txt",
+                "manual.txt",
+                "hash-old",
+                "txt",
+                &[document_chunk("anterior")],
+            )
+            .unwrap();
+        db.publish_document_index(
+            library,
+            Some(id),
+            "manual-nuevo.txt",
+            "manual-nuevo.txt",
+            "hash-new",
+            "txt",
+            &[document_chunk("nuevo")],
+        )
+        .unwrap();
+
+        let document = db
+            .list_documents(library)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(document.hash, "hash-new");
+        assert_eq!(document.status, "listo");
+        let chunks = db.library_chunks(library).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].content, "nuevo");
+    }
+
+    #[test]
+    fn hash_conflict_during_reindex_preserves_previous_ready_index() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let db = Database::open(directory.path().join("document-hash-conflict.db")).unwrap();
+        let library = db.create_library("Biblioteca").unwrap();
+        let first = db
+            .publish_document_index(
+                library,
+                None,
+                "uno.txt",
+                "uno.txt",
+                "hash-uno",
+                "txt",
+                &[document_chunk("contenido anterior")],
+            )
+            .unwrap();
+        db.publish_document_index(
+            library,
+            None,
+            "dos.txt",
+            "dos.txt",
+            "hash-dos",
+            "txt",
+            &[document_chunk("segundo")],
+        )
+        .unwrap();
+
+        let error = db
+            .publish_document_index(
+                library,
+                Some(first),
+                "uno-editado.txt",
+                "uno-editado.txt",
+                "hash-dos",
+                "txt",
+                &[document_chunk("contenido nuevo")],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("ya existe"));
+        let document = db
+            .list_documents(library)
+            .unwrap()
+            .into_iter()
+            .find(|document| document.id == first)
+            .unwrap();
+        assert_eq!(document.hash, "hash-uno");
+        assert_eq!(document.status, "listo");
+        assert_eq!(
+            db.library_chunks(library).unwrap()[0].content,
+            "contenido anterior"
+        );
+    }
+
+    #[test]
+    fn failed_document_publish_rolls_back_new_and_previous_records() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let db = Database::open(directory.path().join("document-publish-rollback.db")).unwrap();
+        let library = db.create_library("Biblioteca").unwrap();
+        let mut duplicate_index_chunks = vec![document_chunk("primero"), document_chunk("segundo")];
+        duplicate_index_chunks[1].chunk_index = 0;
+        assert!(
+            db.publish_document_index(
+                library,
+                None,
+                "fallido.txt",
+                "fallido.txt",
+                "hash-fallido",
+                "txt",
+                &duplicate_index_chunks,
+            )
+            .is_err()
+        );
+        assert!(db.list_documents(library).unwrap().is_empty());
+
+        let id = db
+            .publish_document_index(
+                library,
+                None,
+                "estable.txt",
+                "estable.txt",
+                "hash-estable",
+                "txt",
+                &[document_chunk("indice estable")],
+            )
+            .unwrap();
+        assert!(
+            db.publish_document_index(
+                library,
+                Some(id),
+                "estable.txt",
+                "estable.txt",
+                "hash-editado",
+                "txt",
+                &duplicate_index_chunks,
+            )
+            .is_err()
+        );
+        let document = db
+            .list_documents(library)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(document.hash, "hash-estable");
+        assert_eq!(
+            db.library_chunks(library).unwrap()[0].content,
+            "indice estable"
         );
     }
 }
