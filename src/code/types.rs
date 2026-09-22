@@ -71,6 +71,7 @@ pub enum ScanPartialReason {
     FileSizeLimit,
     TraversalError,
     ReadError,
+    SourceChanged,
     EmbeddingError,
     Cancelled,
     SingleFileScope,

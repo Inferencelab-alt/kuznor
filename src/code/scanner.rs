@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::Path,
+    path::{Component, Path},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use super::types::{ScanPartialReason, ScanReport, ScannedCodeFile};
 
 const MAX_FILES: usize = 1_000;
-const MAX_FILE_BYTES: u64 = 512 * 1024;
-const MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
+pub const MAX_FILE_BYTES: u64 = 512 * 1024;
+pub const MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_DEPTH: usize = 20;
 
 #[derive(Clone, Copy)]
@@ -32,6 +32,10 @@ const DEFAULT_LIMITS: ScanLimits = ScanLimits {
 struct ScanControl {
     #[cfg(test)]
     fail_read_dir: Option<std::path::PathBuf>,
+    #[cfg(test)]
+    fail_metadata: Option<std::path::PathBuf>,
+    #[cfg(test)]
+    fail_canonicalize: Option<std::path::PathBuf>,
 }
 
 const SUPPORTED: &[(&str, &str)] = &[
@@ -77,7 +81,26 @@ fn scan_project_with_limits(
     limits: ScanLimits,
     fail_read_dir: Option<std::path::PathBuf>,
 ) -> Result<ScanReport> {
-    scan_project(root, cancelled, limits, &ScanControl { fail_read_dir })
+    scan_project_with_control(
+        root,
+        cancelled,
+        limits,
+        ScanControl {
+            fail_read_dir,
+            fail_metadata: None,
+            fail_canonicalize: None,
+        },
+    )
+}
+
+#[cfg(test)]
+fn scan_project_with_control(
+    root: &Path,
+    cancelled: &AtomicBool,
+    limits: ScanLimits,
+    control: ScanControl,
+) -> Result<ScanReport> {
+    scan_project(root, cancelled, limits, &control)
 }
 
 fn scan_project(
@@ -86,8 +109,7 @@ fn scan_project(
     limits: ScanLimits,
     control: &ScanControl,
 ) -> Result<ScanReport> {
-    let root = root
-        .canonicalize()
+    let root = canonicalize_path(root, control)
         .with_context(|| format!("No se pudo abrir {}", root.display()))?;
     if !root.is_dir() {
         anyhow::bail!("La ruta seleccionada no es una carpeta");
@@ -118,9 +140,14 @@ pub fn scan_single_file(path: &Path) -> Result<ScannedCodeFile> {
     let root = absolute_path
         .parent()
         .context("El archivo no tiene carpeta")?;
-    match scanned_file(root, &absolute_path, DEFAULT_LIMITS)? {
+    match scanned_file(
+        root,
+        &absolute_path,
+        DEFAULT_LIMITS,
+        &ScanControl::default(),
+    )? {
         ScannedFile::Indexable(file) => Ok(file),
-        ScannedFile::PolicyExcluded | ScannedFile::TooLarge => {
+        ScannedFile::PolicyExcluded | ScannedFile::TooLarge | ScannedFile::UnsafePath => {
             anyhow::bail!("Archivo no soportado o excluido")
         }
     }
@@ -184,26 +211,50 @@ fn scan_directory(
             }
         };
         let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
+        let metadata = match symlink_metadata(&path, control) {
+            Ok(metadata) => metadata,
             Err(error) => {
-                report.errors.push(error.to_string());
+                record_error(report, &path, "metadata", &error);
                 report.mark_partial(ScanPartialReason::TraversalError);
                 continue;
             }
         };
-        if file_type.is_symlink() {
+        if metadata.file_type().is_symlink() {
             report.skipped += 1;
             continue;
         }
-        if file_type.is_dir() {
-            if ignored_directory(&entry.file_name().to_string_lossy())
-                || generated_browser_directory(root, &path)
-            {
+        if metadata.is_dir() {
+            let file_name = entry.file_name();
+            let name = match file_name.to_str() {
+                Some(name) => name,
+                None => {
+                    record_error(
+                        report,
+                        &path,
+                        "ruta",
+                        "La ruta no puede representarse de forma segura como UTF-8",
+                    );
+                    report.mark_partial(ScanPartialReason::TraversalError);
+                    continue;
+                }
+            };
+            let canonical = match canonicalize_path(&path, control) {
+                Ok(path) if path.starts_with(root) => path,
+                Ok(_) => {
+                    report.skipped += 1;
+                    continue;
+                }
+                Err(error) => {
+                    record_error(report, &path, "canonicalizacion", &error);
+                    report.mark_partial(ScanPartialReason::TraversalError);
+                    continue;
+                }
+            };
+            if ignored_directory(name) || generated_browser_directory(root, &path) {
                 report.skipped += 1;
             } else if let Err(error) = scan_directory(
                 root,
-                &path,
+                &canonical,
                 depth + 1,
                 total_bytes,
                 report,
@@ -227,7 +278,7 @@ fn scan_directory(
             report.mark_partial(ScanPartialReason::TotalBytesLimit);
             continue;
         }
-        match scanned_file(root, &path, limits) {
+        match scanned_file(root, &path, limits, control) {
             Ok(ScannedFile::Indexable(file))
                 if *total_bytes + file.size_bytes <= limits.max_total_bytes =>
             {
@@ -249,13 +300,33 @@ fn scan_directory(
                 report.mark_partial(ScanPartialReason::FileSizeLimit);
             }
             Ok(ScannedFile::PolicyExcluded) => report.skipped += 1,
+            Ok(ScannedFile::UnsafePath) => {
+                record_error(
+                    report,
+                    &path,
+                    "ruta",
+                    "La ruta no puede representarse de forma segura como UTF-8",
+                );
+                report.mark_partial(ScanPartialReason::TraversalError);
+            }
             Err(error) => {
-                report.errors.push(error.to_string());
+                record_error(report, &path, "escaneo", &error);
                 report.mark_partial(ScanPartialReason::TraversalError);
             }
         }
     }
     Ok(())
+}
+
+fn record_error<E: std::fmt::Display + ?Sized>(
+    report: &mut ScanReport,
+    path: &Path,
+    stage: &str,
+    error: &E,
+) {
+    report
+        .errors
+        .push(format!("{} ({stage}): {error}", path.display()));
 }
 
 fn read_directory(directory: &Path, control: &ScanControl) -> std::io::Result<fs::ReadDir> {
@@ -271,13 +342,45 @@ fn read_directory(directory: &Path, control: &ScanControl) -> std::io::Result<fs
     fs::read_dir(directory)
 }
 
+fn symlink_metadata(path: &Path, control: &ScanControl) -> std::io::Result<fs::Metadata> {
+    #[cfg(not(test))]
+    let _ = control;
+    #[cfg(test)]
+    if control.fail_metadata.as_deref() == Some(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "error de metadata inyectado",
+        ));
+    }
+    fs::symlink_metadata(path)
+}
+
+fn canonicalize_path(path: &Path, control: &ScanControl) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(not(test))]
+    let _ = control;
+    #[cfg(test)]
+    if control.fail_canonicalize.as_deref() == Some(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "error de canonicalizacion inyectado",
+        ));
+    }
+    path.canonicalize()
+}
+
 enum ScannedFile {
     Indexable(ScannedCodeFile),
     PolicyExcluded,
     TooLarge,
+    UnsafePath,
 }
 
-fn scanned_file(root: &Path, path: &Path, limits: ScanLimits) -> Result<ScannedFile> {
+fn scanned_file(
+    root: &Path,
+    path: &Path,
+    limits: ScanLimits,
+    control: &ScanControl,
+) -> Result<ScannedFile> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -288,21 +391,24 @@ fn scanned_file(root: &Path, path: &Path, limits: ScanLimits) -> Result<ScannedF
     let Some(language) = supported_language(path) else {
         return Ok(ScannedFile::PolicyExcluded);
     };
-    let metadata = fs::metadata(path)?;
+    let metadata = symlink_metadata(path, control)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(ScannedFile::PolicyExcluded);
+    }
     if !metadata.is_file() {
         return Ok(ScannedFile::PolicyExcluded);
     }
     if metadata.len() > limits.max_file_bytes {
         return Ok(ScannedFile::TooLarge);
     }
-    let canonical = path.canonicalize()?;
+    let canonical = canonicalize_path(path, control)?;
     if !canonical.starts_with(root) {
         return Ok(ScannedFile::PolicyExcluded);
     }
-    let relative_path = canonical
-        .strip_prefix(root)?
-        .to_string_lossy()
-        .replace('\\', "/");
+    let relative_path = match relative_path_for_storage(root, &canonical) {
+        Ok(path) => path,
+        Err(_) => return Ok(ScannedFile::UnsafePath),
+    };
     let extension = canonical
         .extension()
         .and_then(|extension| extension.to_str())
@@ -315,6 +421,118 @@ fn scanned_file(root: &Path, path: &Path, limits: ScanLimits) -> Result<ScannedF
         language: language.into(),
         size_bytes: metadata.len(),
     }))
+}
+
+pub fn relative_path_for_storage(root: &Path, path: &Path) -> Result<String> {
+    let relative = path
+        .strip_prefix(root)
+        .with_context(|| format!("{} queda fuera del proyecto", path.display()))?;
+    let relative = relative
+        .to_str()
+        .context("La ruta no puede representarse de forma segura como UTF-8")?;
+    if relative.is_empty()
+        || Path::new(relative)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!("La ruta relativa no es segura para persistir");
+    }
+    Ok(relative.replace('\\', "/"))
+}
+
+pub fn path_for_storage(path: &Path) -> Result<String> {
+    Ok(path
+        .to_str()
+        .context("La ruta del proyecto no puede representarse de forma segura como UTF-8")?
+        .to_owned())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MissingPathVerification {
+    pub confirmed_missing: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+pub fn verify_missing_code_files(
+    root: &Path,
+    report: &ScanReport,
+    indexed_paths: impl IntoIterator<Item = String>,
+) -> MissingPathVerification {
+    let mut verification = MissingPathVerification::default();
+    if !report.is_complete() {
+        verification
+            .errors
+            .push("El scan no esta completo; no se puede verificar pruning".into());
+        return verification;
+    }
+    let root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            verification
+                .errors
+                .push(format!("{} (canonicalizacion): {error}", root.display()));
+            return verification;
+        }
+    };
+    for relative_path in indexed_paths {
+        if report
+            .files
+            .iter()
+            .any(|file| file.relative_path == relative_path)
+        {
+            continue;
+        }
+        let candidate = match safe_relative_join(&root, &relative_path) {
+            Ok(path) => path,
+            Err(error) => {
+                verification.errors.push(format!(
+                    "{} (verificacion de pruning): {error}",
+                    relative_path
+                ));
+                continue;
+            }
+        };
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                verification.confirmed_missing.push(relative_path);
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() => verification.errors.push(format!(
+                "{} (verificacion de pruning): enlace no verificable",
+                candidate.display()
+            )),
+            Ok(_) => match candidate.canonicalize() {
+                Ok(canonical) if canonical.starts_with(&root) => verification.errors.push(format!(
+                    "{} (verificacion de pruning): el archivo reaparecio o cambio durante el scan",
+                    candidate.display()
+                )),
+                Ok(_) => verification.errors.push(format!(
+                    "{} (verificacion de pruning): la ruta sale del proyecto",
+                    candidate.display()
+                )),
+                Err(error) => verification.errors.push(format!(
+                    "{} (verificacion de pruning): {error}",
+                    candidate.display()
+                )),
+            },
+            Err(error) => verification.errors.push(format!(
+                "{} (verificacion de pruning): {error}",
+                candidate.display()
+            )),
+        }
+    }
+    verification
+}
+
+fn safe_relative_join(root: &Path, relative_path: &str) -> Result<std::path::PathBuf> {
+    let relative = Path::new(relative_path);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!("ruta relativa insegura");
+    }
+    Ok(root.join(relative))
 }
 
 fn ignored_directory(name: &str) -> bool {
@@ -450,7 +668,13 @@ mod tests {
             .tempfile_in("target")
             .unwrap();
         assert!(matches!(
-            scanned_file(root.path(), outside.path(), DEFAULT_LIMITS).unwrap(),
+            scanned_file(
+                root.path(),
+                outside.path(),
+                DEFAULT_LIMITS,
+                &ScanControl::default(),
+            )
+            .unwrap(),
             ScannedFile::PolicyExcluded
         ));
     }
@@ -565,5 +789,103 @@ mod tests {
         .unwrap();
         assert!(!report.is_complete());
         assert!(report.errors.iter().any(|error| error.contains("acceso")));
+    }
+
+    #[test]
+    fn preserves_unicode_and_space_paths_without_lossy_storage() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let source = directory.path().join("carpeta con espacios/niño.rs");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "fn niño() {}").unwrap();
+
+        let report = scan_project_with_cancel(directory.path(), &AtomicBool::new(false)).unwrap();
+
+        assert!(report.is_complete());
+        assert_eq!(
+            report.files[0].relative_path,
+            "carpeta con espacios/niño.rs"
+        );
+    }
+
+    #[test]
+    fn metadata_errors_are_partial_with_path_context() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let source = directory.path().join("main.rs");
+        fs::write(&source, "fn main() {}").unwrap();
+
+        let report = scan_project_with_control(
+            directory.path(),
+            &AtomicBool::new(false),
+            DEFAULT_LIMITS,
+            ScanControl {
+                fail_read_dir: None,
+                fail_metadata: Some(source.canonicalize().unwrap()),
+                fail_canonicalize: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!report.is_complete());
+        assert!(report.errors.iter().any(|error| error.contains("metadata")));
+        assert!(report.errors.iter().any(|error| error.contains("main.rs")));
+    }
+
+    #[test]
+    fn verification_only_confirms_paths_that_remain_absent() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        fs::write(directory.path().join("kept.rs"), "fn kept() {}").unwrap();
+        let report = scan_project_with_cancel(directory.path(), &AtomicBool::new(false)).unwrap();
+        fs::write(directory.path().join("reappeared.rs"), "fn reappeared() {}").unwrap();
+
+        let verification = verify_missing_code_files(
+            directory.path(),
+            &report,
+            ["missing.rs".into(), "reappeared.rs".into()],
+        );
+
+        assert_eq!(verification.confirmed_missing, ["missing.rs"]);
+        assert_eq!(verification.errors.len(), 1);
+        assert!(verification.errors[0].contains("reaparecio"));
+    }
+
+    #[test]
+    fn rejects_relative_paths_that_escape_the_root() {
+        let root = tempfile::tempdir_in("target").unwrap();
+        assert!(safe_relative_join(root.path(), "../outside.rs").is_err());
+        assert!(safe_relative_join(root.path(), "/outside.rs").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_symlink_is_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir_in("target").unwrap();
+        let outside = tempfile::tempdir_in("target").unwrap();
+        fs::write(outside.path().join("outside.rs"), "fn outside() {}").unwrap();
+        symlink(outside.path(), root.path().join("linked")).unwrap();
+
+        let report = scan_project_with_cancel(root.path(), &AtomicBool::new(false)).unwrap();
+
+        assert!(report.is_complete());
+        assert!(report.files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_are_not_persisted_lossily() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join(OsString::from_vec(vec![
+            b'b', b'a', b'd', 0xff, b'.', b'r', b's',
+        ]));
+        fs::write(path, "fn invalid_name() {}").unwrap();
+
+        let report = scan_project_with_cancel(directory.path(), &AtomicBool::new(false)).unwrap();
+
+        assert!(!report.is_complete());
+        assert!(report.files.is_empty());
+        assert!(report.errors.iter().any(|error| error.contains("UTF-8")));
     }
 }

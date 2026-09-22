@@ -689,22 +689,37 @@ impl Database {
         Ok(file_id)
     }
 
-    pub fn delete_missing_code_files(&self, project_id: i64, report: &ScanReport) -> Result<()> {
+    pub fn delete_missing_code_files(
+        &self,
+        project_id: i64,
+        report: &ScanReport,
+        confirmed_missing: &[String],
+    ) -> Result<()> {
         if !report.is_complete() {
             anyhow::bail!(
                 "Kuznor no puede eliminar archivos del indice tras un scan parcial o fallido"
             );
         }
-        for file in self.list_code_files(project_id)? {
-            if !report
+        for relative_path in confirmed_missing {
+            if report
                 .files
                 .iter()
-                .any(|path| path.relative_path == file.relative_path)
+                .any(|file| file.relative_path == *relative_path)
             {
-                self.connection()?
-                    .execute("DELETE FROM code_files WHERE id=?1", [file.id])?;
+                anyhow::bail!(
+                    "Kuznor no puede eliminar un archivo observado durante el mismo scan"
+                );
             }
         }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        for relative_path in confirmed_missing {
+            transaction.execute(
+                "DELETE FROM code_files WHERE project_id=?1 AND relative_path=?2",
+                params![project_id, relative_path],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1174,7 +1189,11 @@ mod tests {
             .unwrap();
 
         database
-            .delete_missing_code_files(project, &scan_report(&["kept.rs"], true))
+            .delete_missing_code_files(
+                project,
+                &scan_report(&["kept.rs"], true),
+                &["deleted.rs".into()],
+            )
             .unwrap();
 
         assert_eq!(
@@ -1242,7 +1261,11 @@ mod tests {
             .unwrap();
 
         let error = database
-            .delete_missing_code_files(first, &scan_report(&["a.rs", "new.rs"], false))
+            .delete_missing_code_files(
+                first,
+                &scan_report(&["a.rs", "new.rs"], false),
+                &["unobserved.rs".into()],
+            )
             .unwrap_err()
             .to_string();
 
@@ -1268,6 +1291,36 @@ mod tests {
             "new-a"
         );
         assert_eq!(database.list_code_files(second).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn complete_scan_cannot_prune_an_observed_file_even_if_the_caller_requests_it() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let database = Database::open(directory.path().join("observed-prune.db")).unwrap();
+        let project = database.upsert_code_project("A", "C:/a").unwrap();
+        database
+            .replace_code_file_index(
+                project,
+                "main.rs",
+                "hash",
+                "rs",
+                "rust",
+                1,
+                &[code_chunk(project, "main")],
+            )
+            .unwrap();
+
+        let error = database
+            .delete_missing_code_files(
+                project,
+                &scan_report(&["main.rs"], true),
+                &["main.rs".into()],
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("observado"));
+        assert_eq!(database.list_code_files(project).unwrap().len(), 1);
     }
 
     #[test]

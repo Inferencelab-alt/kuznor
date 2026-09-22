@@ -29,11 +29,15 @@ use crate::{
     },
     code::{
         indexer::{
-            CodeLocalProvider, chunk_code, content_hash, embed_code_chunks_cancellable,
-            needs_reindex, read_source,
+            CodeLocalProvider, SourceReadErrorKind, chunk_code, content_hash,
+            embed_code_chunks_cancellable, needs_reindex, read_source, source_read_error_kind,
+            source_unchanged,
         },
         prompt::{code_history_without_evidence, code_prompt, code_prompt_diagnostic},
-        scanner::{scan_project_with_cancel, scan_single_file},
+        scanner::{
+            MAX_TOTAL_BYTES, path_for_storage, relative_path_for_storage, scan_project_with_cancel,
+            scan_single_file, verify_missing_code_files,
+        },
         search::{resolve_file_scope, search_code_scoped, targets_selected_file},
         types::{
             CodeFile, CodeProject, PROJECT_FAILED, PROJECT_PARTIAL, PROJECT_READY,
@@ -1470,15 +1474,12 @@ impl KuznorApp {
                     .and_then(|name| name.to_str())
                     .unwrap_or("Proyecto")
                     .to_owned();
-                let project_id = db.upsert_code_project(&name, &root.to_string_lossy())?;
+                let project_id = db.upsert_code_project(&name, &path_for_storage(&root)?)?;
                 indexed_project_id = Some(project_id);
                 let mut report = if single_file {
                     let mut file = scan_single_file(&path)?;
                     let absolute_path = path.canonicalize()?;
-                    file.relative_path = absolute_path
-                        .strip_prefix(&root)?
-                        .to_string_lossy()
-                        .replace('\\', "/");
+                    file.relative_path = relative_path_for_storage(&root, &absolute_path)?;
                     file.absolute_path = absolute_path;
                     let mut report = ScanReport::complete();
                     report.files.push(file);
@@ -1503,33 +1504,55 @@ impl KuznorApp {
                 let mut pending = Vec::new();
                 let mut unchanged = 0;
                 let mut failed = report.errors.len();
+                let mut read_bytes = 0_u64;
                 let observed_files = report.files.clone();
                 for file in &observed_files {
                     if cancelled.load(Ordering::Relaxed) {
                         anyhow::bail!("Indexacion cancelada");
                     }
                     match read_source(&file.absolute_path) {
-                        Ok(content) => {
-                            let hash = content_hash(&content);
+                        Ok(source) => {
+                            if read_bytes.saturating_add(source.size_bytes) > MAX_TOTAL_BYTES {
+                                failed += 1;
+                                report.errors.push(format!(
+                                    "{} (lectura): supera el limite total de bytes durante la indexacion",
+                                    file.relative_path
+                                ));
+                                report.mark_partial(ScanPartialReason::TotalBytesLimit);
+                                continue;
+                            }
+                            read_bytes += source.size_bytes;
+                            let hash = content_hash(&source.content);
                             let previous = existing.get(&file.relative_path);
                             if previous.is_some_and(|old| {
                                 old.error.is_none() && !needs_reindex(Some(&old.hash), &hash)
                             }) {
                                 unchanged += 1;
                             } else {
-                                pending.push((file.clone(), content, hash));
+                                pending.push((file.clone(), source, hash));
                             }
                         }
                         Err(error) => {
                             failed += 1;
                             report
                                 .errors
-                                .push(format!("No se pudo leer {}: {error}", file.relative_path));
-                            report.mark_partial(ScanPartialReason::ReadError);
+                                .push(format!("{} (lectura): {error}", file.relative_path));
+                            report.mark_partial(match source_read_error_kind(&error) {
+                                Some(SourceReadErrorKind::TooLarge) => {
+                                    ScanPartialReason::FileSizeLimit
+                                }
+                                Some(SourceReadErrorKind::Changed) => {
+                                    ScanPartialReason::SourceChanged
+                                }
+                                _ => ScanPartialReason::ReadError,
+                            });
                         }
                     }
                 }
-                if !pending.is_empty() {
+                if pending
+                    .iter()
+                    .any(|(_, source, _)| !source.content.trim().is_empty())
+                {
                     tx.send(Event::EmbeddingStatus(ServiceStatus::Starting))
                         .ok();
                     processes
@@ -1542,7 +1565,7 @@ impl KuznorApp {
                     settings: settings.clone(),
                     cancelled: cancelled.clone(),
                 };
-                for (position, (file, content, hash)) in pending.into_iter().enumerate() {
+                for (position, (file, source, hash)) in pending.into_iter().enumerate() {
                     if cancelled.load(Ordering::Relaxed) {
                         anyhow::bail!("Indexacion cancelada");
                     }
@@ -1559,12 +1582,33 @@ impl KuznorApp {
                         &file.relative_path,
                         &file.extension,
                         &file.language,
-                        &content,
+                        &source.content,
                     );
                     match embed_code_chunks_cancellable(&provider, chunks, &cancelled) {
                         Ok(chunks) => {
                             if cancelled.load(Ordering::Relaxed) {
                                 anyhow::bail!("Indexacion cancelada");
+                            }
+                            match source_unchanged(&file.absolute_path, &source) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    failed += 1;
+                                    report.errors.push(format!(
+                                        "{} (verificacion): el archivo cambio durante la indexacion; se conservo el indice anterior",
+                                        file.relative_path
+                                    ));
+                                    report.mark_partial(ScanPartialReason::SourceChanged);
+                                    continue;
+                                }
+                                Err(error) => {
+                                    failed += 1;
+                                    report.errors.push(format!(
+                                        "{} (verificacion): {error}",
+                                        file.relative_path
+                                    ));
+                                    report.mark_partial(ScanPartialReason::SourceChanged);
+                                    continue;
+                                }
                             }
                             db.replace_code_file_index(
                                 project_id,
@@ -1572,7 +1616,7 @@ impl KuznorApp {
                                 &hash,
                                 &file.extension,
                                 &file.language,
-                                file.size_bytes,
+                                source.size_bytes,
                                 &chunks,
                             )?;
                         }
@@ -1589,9 +1633,22 @@ impl KuznorApp {
                 if cancelled.load(Ordering::Relaxed) {
                     anyhow::bail!("Indexacion cancelada");
                 }
+                if report.is_complete() {
+                    let verification =
+                        verify_missing_code_files(&root, &report, existing.keys().cloned());
+                    if !verification.errors.is_empty() {
+                        report.errors.extend(verification.errors);
+                        report.mark_partial(ScanPartialReason::TraversalError);
+                    } else {
+                        db.delete_missing_code_files(
+                            project_id,
+                            &report,
+                            &verification.confirmed_missing,
+                        )?;
+                    }
+                }
                 let complete = report.is_complete();
                 if complete {
-                    db.delete_missing_code_files(project_id, &report)?;
                     db.set_code_project_status(project_id, PROJECT_READY)?;
                 } else {
                     db.set_code_project_status(project_id, PROJECT_PARTIAL)?;

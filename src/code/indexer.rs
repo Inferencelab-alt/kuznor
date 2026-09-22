@@ -1,4 +1,6 @@
 use std::{
+    fs::File,
+    io::Read,
     path::Path,
     sync::{
         Arc,
@@ -19,6 +21,7 @@ use crate::{
     rag::embeddings::{EmbeddingProvider, embed_chunks_with_retry},
 };
 
+use super::scanner::MAX_FILE_BYTES;
 use super::types::CodeChunk;
 
 const MAX_CHUNK_LINES: usize = 80;
@@ -71,9 +74,121 @@ impl EmbeddingProvider for CodeLocalProvider {
     }
 }
 
-pub fn read_source(path: &Path) -> Result<String> {
-    std::fs::read_to_string(path)
-        .with_context(|| format!("No se pudo leer {} como texto UTF-8", path.display()))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceContent {
+    pub content: String,
+    pub size_bytes: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceReadErrorKind {
+    TooLarge,
+    InvalidUtf8,
+    Binary,
+    Changed,
+}
+
+#[derive(Debug)]
+struct SourceReadError {
+    kind: SourceReadErrorKind,
+    message: String,
+}
+
+impl std::fmt::Display for SourceReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SourceReadError {}
+
+pub fn source_read_error_kind(error: &anyhow::Error) -> Option<SourceReadErrorKind> {
+    error
+        .downcast_ref::<SourceReadError>()
+        .map(|error| error.kind)
+}
+
+pub fn read_source(path: &Path) -> Result<SourceContent> {
+    let mut file =
+        File::open(path).with_context(|| format!("No se pudo abrir {}", path.display()))?;
+    let before = file
+        .metadata()
+        .with_context(|| format!("No se pudo obtener metadata de {}", path.display()))?;
+    let bytes = read_bounded(&mut file, MAX_FILE_BYTES)?;
+    let after = std::fs::metadata(path)
+        .with_context(|| format!("No se pudo obtener metadata final de {}", path.display()))?;
+    if metadata_changed(&before, &after) {
+        return Err(SourceReadError {
+            kind: SourceReadErrorKind::Changed,
+            message: format!("El archivo cambio mientras se leia: {}", path.display()),
+        }
+        .into());
+    }
+    decode_source(bytes, path, after.len(), after.modified().ok())
+}
+
+pub fn source_unchanged(path: &Path, source: &SourceContent) -> Result<bool> {
+    let metadata = std::fs::metadata(path).with_context(|| {
+        format!(
+            "No se pudo verificar {} antes de publicarlo",
+            path.display()
+        )
+    })?;
+    Ok(metadata.len() == source.size_bytes && metadata.modified().ok() == source.modified)
+}
+
+fn metadata_changed(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    before.len() != after.len() || before.modified().ok() != after.modified().ok()
+}
+
+fn read_bounded(reader: &mut impl Read, max_file_bytes: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity((max_file_bytes.min(64 * 1024)) as usize);
+    reader
+        .take(max_file_bytes + 1)
+        .read_to_end(&mut bytes)
+        .context("No se pudo leer el contenido del archivo")?;
+    if bytes.len() as u64 > max_file_bytes {
+        return Err(SourceReadError {
+            kind: SourceReadErrorKind::TooLarge,
+            message: format!("El archivo supera el limite de {max_file_bytes} bytes"),
+        }
+        .into());
+    }
+    Ok(bytes)
+}
+
+fn decode_source(
+    bytes: Vec<u8>,
+    path: &Path,
+    size_bytes: u64,
+    modified: Option<std::time::SystemTime>,
+) -> Result<SourceContent> {
+    if bytes.contains(&0) {
+        return Err(SourceReadError {
+            kind: SourceReadErrorKind::Binary,
+            message: format!(
+                "El archivo contiene bytes NUL y se trato como binario: {}",
+                path.display()
+            ),
+        }
+        .into());
+    }
+    let content = String::from_utf8(bytes).map_err(|_| SourceReadError {
+        kind: SourceReadErrorKind::InvalidUtf8,
+        message: format!(
+            "El archivo no contiene texto UTF-8 valido: {}",
+            path.display()
+        ),
+    })?;
+    Ok(SourceContent {
+        content: content
+            .strip_prefix('\u{feff}')
+            .unwrap_or(&content)
+            .to_owned(),
+        size_bytes,
+        modified,
+    })
 }
 
 pub fn content_hash(content: &str) -> String {
@@ -279,8 +394,8 @@ mod tests {
         std::io::Write::write_all(&mut file, b"fn original() -> u8 { 7 }").unwrap();
         let before = std::fs::read(file.path()).unwrap();
         let content = read_source(file.path()).unwrap();
-        let _ = content_hash(&content);
-        let _ = chunk_code(1, 1, "src/lib.rs", "rs", "rust", &content);
+        let _ = content_hash(&content.content);
+        let _ = chunk_code(1, 1, "src/lib.rs", "rs", "rust", &content.content);
         assert_eq!(std::fs::read(file.path()).unwrap(), before);
     }
 
@@ -302,7 +417,7 @@ mod tests {
                     path.file_name().unwrap().to_str().unwrap(),
                     "rs",
                     "rust",
-                    &content,
+                    &content.content,
                 )),
                 Err(error) => errors.push(error.to_string()),
             }
@@ -311,6 +426,95 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(indexed.len(), 1);
         assert!(indexed[0].content.contains("fn valid"));
+    }
+
+    #[test]
+    fn normalizes_utf8_bom_and_accepts_empty_files_without_chunks() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let bom = directory.path().join("bom.rs");
+        let empty = directory.path().join("empty.rs");
+        std::fs::write(&bom, b"\xef\xbb\xbffn bom() {}").unwrap();
+        std::fs::write(&empty, []).unwrap();
+
+        let bom_source = read_source(&bom).unwrap();
+        let empty_source = read_source(&empty).unwrap();
+
+        assert_eq!(bom_source.content, "fn bom() {}");
+        assert!(chunk_code(1, 1, "empty.rs", "rs", "rust", &empty_source.content).is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_and_binary_nul_without_guessing_an_encoding() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let invalid = directory.path().join("invalid.rs");
+        let binary = directory.path().join("binary.rs");
+        std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+        std::fs::write(&binary, b"fn binary() {}\0").unwrap();
+
+        let invalid_error = read_source(&invalid).unwrap_err();
+        let binary_error = read_source(&binary).unwrap_err();
+
+        assert_eq!(
+            source_read_error_kind(&invalid_error),
+            Some(SourceReadErrorKind::InvalidUtf8)
+        );
+        assert_eq!(
+            source_read_error_kind(&binary_error),
+            Some(SourceReadErrorKind::Binary)
+        );
+    }
+
+    #[test]
+    fn bounded_read_rejects_files_that_grow_after_scanning() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let source = directory.path().join("growing.rs");
+        std::fs::write(&source, "fn initially_small() {}").unwrap();
+        let scanned_size = std::fs::metadata(&source).unwrap().len();
+        let file = File::options().write(true).open(&source).unwrap();
+        file.set_len(MAX_FILE_BYTES + 1).unwrap();
+
+        let error = read_source(&source).unwrap_err();
+
+        assert!(scanned_size < MAX_FILE_BYTES);
+        assert_eq!(
+            source_read_error_kind(&error),
+            Some(SourceReadErrorKind::TooLarge)
+        );
+    }
+
+    #[test]
+    fn detects_source_changes_before_publication() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let path = directory.path().join("changed.rs");
+        std::fs::write(&path, "fn before() {}").unwrap();
+        let source = read_source(&path).unwrap();
+        std::fs::write(&path, "fn after_change_is_longer() {}").unwrap();
+
+        assert!(!source_unchanged(&path, &source).unwrap());
+    }
+
+    #[test]
+    fn read_errors_are_contextual_and_bounded_reader_stops_at_the_limit() {
+        struct FailingReader;
+
+        impl Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "fallo de lectura inyectado",
+                ))
+            }
+        }
+
+        let error = read_bounded(&mut FailingReader, 8).unwrap_err();
+        assert!(error.to_string().contains("contenido"));
+
+        let mut oversized = std::io::Cursor::new(vec![b'x'; 9]);
+        let error = read_bounded(&mut oversized, 8).unwrap_err();
+        assert_eq!(
+            source_read_error_kind(&error),
+            Some(SourceReadErrorKind::TooLarge)
+        );
     }
 
     #[test]
