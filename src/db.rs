@@ -9,7 +9,7 @@ use chrono::Utc;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use crate::{
-    code::types::{CodeChunk, CodeFile, CodeProject},
+    code::types::{CodeChunk, CodeFile, CodeProject, ScanReport},
     models::{Chat, Chunk, Document, Library, Message, Profile, Source},
 };
 
@@ -623,7 +623,7 @@ impl Database {
 
     pub fn mark_interrupted_code_projects(&self) -> Result<usize> {
         Ok(self.connection()?.execute(
-            "UPDATE code_projects SET status='incomplete' WHERE status IN ('indexing','escaneando')",
+            "UPDATE code_projects SET status='partial' WHERE status IN ('indexing','escaneando')",
             [],
         )?)
     }
@@ -648,7 +648,7 @@ impl Database {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn upsert_code_file(
+    pub fn replace_code_file_index(
         &self,
         project_id: i64,
         relative_path: &str,
@@ -656,24 +656,19 @@ impl Database {
         extension: &str,
         language: &str,
         size_bytes: u64,
-        error: Option<&str>,
+        chunks: &[CodeChunk],
     ) -> Result<i64> {
-        let conn = self.connection()?;
-        conn.execute(
-            "INSERT INTO code_files(project_id,relative_path,hash,extension,language,size_bytes,error,indexed_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(project_id,relative_path) DO UPDATE SET hash=excluded.hash,extension=excluded.extension,language=excluded.language,size_bytes=excluded.size_bytes,error=excluded.error,indexed_at=excluded.indexed_at",
-            params![project_id, relative_path, hash, extension, language, size_bytes as i64, error, Utc::now().to_rfc3339()],
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO code_files(project_id,relative_path,hash,extension,language,size_bytes,error,indexed_at) VALUES(?1,?2,?3,?4,?5,?6,NULL,?7) ON CONFLICT(project_id,relative_path) DO UPDATE SET hash=excluded.hash,extension=excluded.extension,language=excluded.language,size_bytes=excluded.size_bytes,error=NULL,indexed_at=excluded.indexed_at",
+            params![project_id, relative_path, hash, extension, language, size_bytes as i64, Utc::now().to_rfc3339()],
         )?;
-        conn.query_row(
+        let file_id = transaction.query_row(
             "SELECT id FROM code_files WHERE project_id=?1 AND relative_path=?2",
             params![project_id, relative_path],
             |row| row.get(0),
-        )
-        .map_err(Into::into)
-    }
-
-    pub fn save_code_chunks(&self, file_id: i64, chunks: &[CodeChunk]) -> Result<()> {
-        let mut conn = self.connection()?;
-        let transaction = conn.transaction()?;
+        )?;
         transaction.execute("DELETE FROM code_chunks WHERE file_id=?1", [file_id])?;
         {
             let mut statement = transaction.prepare(
@@ -691,16 +686,21 @@ impl Database {
             }
         }
         transaction.commit()?;
-        Ok(())
+        Ok(file_id)
     }
 
-    pub fn delete_missing_code_files(
-        &self,
-        project_id: i64,
-        current_paths: &[String],
-    ) -> Result<()> {
+    pub fn delete_missing_code_files(&self, project_id: i64, report: &ScanReport) -> Result<()> {
+        if !report.is_complete() {
+            anyhow::bail!(
+                "Kuznor no puede eliminar archivos del indice tras un scan parcial o fallido"
+            );
+        }
         for file in self.list_code_files(project_id)? {
-            if !current_paths.iter().any(|path| path == &file.relative_path) {
+            if !report
+                .files
+                .iter()
+                .any(|path| path.relative_path == file.relative_path)
+            {
                 self.connection()?
                     .execute("DELETE FROM code_files WHERE id=?1", [file.id])?;
             }
@@ -1111,6 +1111,259 @@ mod tests {
             .unwrap()
     }
 
+    fn scan_report(paths: &[&str], complete: bool) -> ScanReport {
+        let mut report = ScanReport::complete();
+        report.files = paths
+            .iter()
+            .map(|relative_path| crate::code::types::ScannedCodeFile {
+                absolute_path: PathBuf::from(relative_path),
+                relative_path: (*relative_path).into(),
+                extension: "rs".into(),
+                language: "rust".into(),
+                size_bytes: 1,
+            })
+            .collect();
+        if !complete {
+            report.mark_partial(crate::code::types::ScanPartialReason::FileLimit);
+        }
+        report
+    }
+
+    fn code_chunk(project_id: i64, content: &str) -> CodeChunk {
+        CodeChunk {
+            id: 0,
+            project_id,
+            file_id: 0,
+            relative_path: "main.rs".into(),
+            extension: "rs".into(),
+            language: "rust".into(),
+            chunk_index: 0,
+            line_start: 1,
+            line_end: 1,
+            content: content.into(),
+            embedding: vec![1.0, 0.0],
+        }
+    }
+
+    #[test]
+    fn complete_scan_prunes_only_the_deleted_file() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let database = Database::open(directory.path().join("complete-prune.db")).unwrap();
+        let project = database.upsert_code_project("A", "C:/a").unwrap();
+        database
+            .replace_code_file_index(
+                project,
+                "kept.rs",
+                "kept",
+                "rs",
+                "rust",
+                1,
+                &[code_chunk(project, "kept")],
+            )
+            .unwrap();
+        database
+            .replace_code_file_index(
+                project,
+                "deleted.rs",
+                "deleted",
+                "rs",
+                "rust",
+                1,
+                &[code_chunk(project, "deleted")],
+            )
+            .unwrap();
+
+        database
+            .delete_missing_code_files(project, &scan_report(&["kept.rs"], true))
+            .unwrap();
+
+        assert_eq!(
+            database
+                .list_code_files(project)
+                .unwrap()
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            ["kept.rs"]
+        );
+    }
+
+    #[test]
+    fn partial_scan_cannot_prune_existing_files_or_other_projects() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let database = Database::open(directory.path().join("partial-prune.db")).unwrap();
+        let first = database.upsert_code_project("A", "C:/a").unwrap();
+        let second = database.upsert_code_project("B", "C:/b").unwrap();
+        for (project, path) in [(first, "a.rs"), (second, "b.rs")] {
+            database
+                .replace_code_file_index(
+                    project,
+                    path,
+                    path,
+                    "rs",
+                    "rust",
+                    1,
+                    &[code_chunk(project, path)],
+                )
+                .unwrap();
+        }
+        database
+            .replace_code_file_index(
+                first,
+                "unobserved.rs",
+                "old-unobserved",
+                "rs",
+                "rust",
+                1,
+                &[code_chunk(first, "unobserved")],
+            )
+            .unwrap();
+        database
+            .replace_code_file_index(
+                first,
+                "a.rs",
+                "new-a",
+                "rs",
+                "rust",
+                1,
+                &[code_chunk(first, "updated")],
+            )
+            .unwrap();
+        database
+            .replace_code_file_index(
+                first,
+                "new.rs",
+                "new-file",
+                "rs",
+                "rust",
+                1,
+                &[code_chunk(first, "new")],
+            )
+            .unwrap();
+
+        let error = database
+            .delete_missing_code_files(first, &scan_report(&["a.rs", "new.rs"], false))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("scan parcial"));
+        let first_files = database.list_code_files(first).unwrap();
+        assert_eq!(first_files.len(), 3);
+        assert!(
+            first_files
+                .iter()
+                .any(|file| file.relative_path == "unobserved.rs")
+        );
+        assert!(
+            first_files
+                .iter()
+                .any(|file| file.relative_path == "new.rs")
+        );
+        assert_eq!(
+            first_files
+                .iter()
+                .find(|file| file.relative_path == "a.rs")
+                .unwrap()
+                .hash,
+            "new-a"
+        );
+        assert_eq!(database.list_code_files(second).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_replacement_rolls_back_and_preserves_the_previous_file_index() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let database = Database::open(directory.path().join("atomic-replace.db")).unwrap();
+        let project = database.upsert_code_project("A", "C:/a").unwrap();
+        database
+            .replace_code_file_index(
+                project,
+                "main.rs",
+                "old-hash",
+                "rs",
+                "rust",
+                1,
+                &[code_chunk(project, "old")],
+            )
+            .unwrap();
+        let mut duplicate = code_chunk(project, "duplicate");
+        duplicate.chunk_index = 0;
+
+        assert!(
+            database
+                .replace_code_file_index(
+                    project,
+                    "main.rs",
+                    "new-hash",
+                    "rs",
+                    "rust",
+                    1,
+                    &[code_chunk(project, "new"), duplicate],
+                )
+                .is_err()
+        );
+
+        assert_eq!(
+            database.list_code_files(project).unwrap()[0].hash,
+            "old-hash"
+        );
+        database.set_code_project_status(project, "ready").unwrap();
+        assert_eq!(database.code_chunks(project).unwrap()[0].content, "old");
+    }
+
+    #[test]
+    fn failed_project_keeps_the_previous_index_records() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let database = Database::open(directory.path().join("failed-project.db")).unwrap();
+        let project = database.upsert_code_project("A", "C:/a").unwrap();
+        database
+            .replace_code_file_index(
+                project,
+                "main.rs",
+                "old-hash",
+                "rs",
+                "rust",
+                1,
+                &[code_chunk(project, "old")],
+            )
+            .unwrap();
+
+        database
+            .set_code_project_status(project, crate::code::types::PROJECT_FAILED)
+            .unwrap();
+
+        assert_eq!(
+            database.list_code_files(project).unwrap()[0].hash,
+            "old-hash"
+        );
+        let chunk_count: i64 = database
+            .connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM code_chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(chunk_count, 1);
+        assert_eq!(
+            database.list_code_projects().unwrap()[0].status,
+            crate::code::types::PROJECT_FAILED
+        );
+    }
+
+    #[test]
+    fn project_statuses_preserve_complete_partial_and_failed_outcomes() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        let database = Database::open(directory.path().join("project-statuses.db")).unwrap();
+        let project = database.upsert_code_project("A", "C:/a").unwrap();
+
+        for status in [
+            crate::code::types::PROJECT_READY,
+            crate::code::types::PROJECT_PARTIAL,
+            crate::code::types::PROJECT_FAILED,
+        ] {
+            database.set_code_project_status(project, status).unwrap();
+            assert_eq!(database.list_code_projects().unwrap()[0].status, status);
+        }
+    }
+
     #[test]
     fn new_database_creates_schema_version_one() {
         let directory = tempfile::tempdir_in("target").unwrap();
@@ -1359,7 +1612,7 @@ mod tests {
             .upsert_code_project("Proyecto", "C:/proyecto")
             .unwrap();
         let file = database
-            .upsert_code_file(project, "main.rs", "hash", "rs", "rust", 1, None)
+            .replace_code_file_index(project, "main.rs", "hash", "rs", "rust", 1, &[])
             .unwrap();
         database.set_code_project_status(project, "ready").unwrap();
         Connection::open(&path)
@@ -1682,12 +1935,6 @@ mod tests {
             db.upsert_code_project("Uno", "C:/projects/uno").unwrap(),
             first
         );
-        let first_file = db
-            .upsert_code_file(first, "src/main.rs", "hash-1", "rs", "rust", 10, None)
-            .unwrap();
-        let second_file = db
-            .upsert_code_file(second, "app.py", "hash-2", "py", "python", 10, None)
-            .unwrap();
         let make_chunk = |project_id, file_id, path: &str| CodeChunk {
             id: 0,
             project_id,
@@ -1701,9 +1948,27 @@ mod tests {
             content: path.into(),
             embedding: vec![1.0, 0.0],
         };
-        db.save_code_chunks(first_file, &[make_chunk(first, first_file, "src/main.rs")])
+        let _first_file = db
+            .replace_code_file_index(
+                first,
+                "src/main.rs",
+                "hash-1",
+                "rs",
+                "rust",
+                10,
+                &[make_chunk(first, 0, "src/main.rs")],
+            )
             .unwrap();
-        db.save_code_chunks(second_file, &[make_chunk(second, second_file, "app.py")])
+        let _second_file = db
+            .replace_code_file_index(
+                second,
+                "app.py",
+                "hash-2",
+                "py",
+                "python",
+                10,
+                &[make_chunk(second, 0, "app.py")],
+            )
             .unwrap();
         db.set_code_project_status(first, "ready").unwrap();
         db.set_code_project_status(second, "ready").unwrap();
@@ -1722,26 +1987,29 @@ mod tests {
         let project = db
             .upsert_code_project("Parcial", "C:/projects/parcial")
             .unwrap();
-        let file = db
-            .upsert_code_file(project, "src/main.rs", "hash", "rs", "rust", 10, None)
+        let _file = db
+            .replace_code_file_index(
+                project,
+                "src/main.rs",
+                "hash",
+                "rs",
+                "rust",
+                10,
+                &[CodeChunk {
+                    id: 0,
+                    project_id: project,
+                    file_id: 0,
+                    relative_path: "src/main.rs".into(),
+                    extension: "rs".into(),
+                    language: "rust".into(),
+                    chunk_index: 0,
+                    line_start: 1,
+                    line_end: 1,
+                    content: "fn main() {}".into(),
+                    embedding: vec![1.0, 0.0],
+                }],
+            )
             .unwrap();
-        db.save_code_chunks(
-            file,
-            &[CodeChunk {
-                id: 0,
-                project_id: project,
-                file_id: file,
-                relative_path: "src/main.rs".into(),
-                extension: "rs".into(),
-                language: "rust".into(),
-                chunk_index: 0,
-                line_start: 1,
-                line_end: 1,
-                content: "fn main() {}".into(),
-                embedding: vec![1.0, 0.0],
-            }],
-        )
-        .unwrap();
         assert_eq!(db.mark_interrupted_code_projects().unwrap(), 1);
         assert!(db.code_chunks(project).unwrap().is_empty());
         db.set_code_project_status(project, "cancelled").unwrap();
@@ -1762,26 +2030,29 @@ mod tests {
         let project = db
             .upsert_code_project("Original", &original_project.to_string_lossy())
             .unwrap();
-        let file = db
-            .upsert_code_file(project, "main.rs", "hash", "rs", "rust", 13, None)
+        let _file = db
+            .replace_code_file_index(
+                project,
+                "main.rs",
+                "hash",
+                "rs",
+                "rust",
+                13,
+                &[CodeChunk {
+                    id: 0,
+                    project_id: project,
+                    file_id: 0,
+                    relative_path: "main.rs".into(),
+                    extension: "rs".into(),
+                    language: "rust".into(),
+                    chunk_index: 0,
+                    line_start: 1,
+                    line_end: 1,
+                    content: "fn main() {}".into(),
+                    embedding: vec![1.0],
+                }],
+            )
             .unwrap();
-        db.save_code_chunks(
-            file,
-            &[CodeChunk {
-                id: 0,
-                project_id: project,
-                file_id: file,
-                relative_path: "main.rs".into(),
-                extension: "rs".into(),
-                language: "rust".into(),
-                chunk_index: 0,
-                line_start: 1,
-                line_end: 1,
-                content: "fn main() {}".into(),
-                embedding: vec![1.0],
-            }],
-        )
-        .unwrap();
 
         db.remove_code_project(project).unwrap();
 

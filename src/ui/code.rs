@@ -198,9 +198,9 @@ fn project_status_label(status: &str) -> &str {
     match status {
         "ready" | "listo" => "listo",
         "indexing" | "escaneando" => "indexando",
+        "partial" | "incomplete" => "incompleto",
         "cancelled" => "cancelado",
         "failed" => "fallido",
-        "incomplete" => "incompleto",
         _ => status,
     }
 }

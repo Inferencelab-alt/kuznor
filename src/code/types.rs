@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 pub const PROJECT_READY: &str = "ready";
-pub const PROJECT_CANCELLED: &str = "cancelled";
+pub const PROJECT_PARTIAL: &str = "partial";
 pub const PROJECT_FAILED: &str = "failed";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,4 +54,51 @@ pub struct ScanReport {
     pub files: Vec<ScannedCodeFile>,
     pub skipped: usize,
     pub errors: Vec<String>,
+    pub completeness: ScanCompleteness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanCompleteness {
+    Complete,
+    Partial(Vec<ScanPartialReason>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanPartialReason {
+    FileLimit,
+    TotalBytesLimit,
+    DepthLimit,
+    FileSizeLimit,
+    TraversalError,
+    ReadError,
+    EmbeddingError,
+    Cancelled,
+    SingleFileScope,
+}
+
+impl ScanReport {
+    pub fn complete() -> Self {
+        Self {
+            files: Vec::new(),
+            skipped: 0,
+            errors: Vec::new(),
+            completeness: ScanCompleteness::Complete,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        matches!(self.completeness, ScanCompleteness::Complete)
+    }
+
+    pub fn mark_partial(&mut self, reason: ScanPartialReason) {
+        match &mut self.completeness {
+            ScanCompleteness::Complete => {
+                self.completeness = ScanCompleteness::Partial(vec![reason])
+            }
+            ScanCompleteness::Partial(reasons) if !reasons.contains(&reason) => {
+                reasons.push(reason)
+            }
+            ScanCompleteness::Partial(_) => {}
+        }
+    }
 }

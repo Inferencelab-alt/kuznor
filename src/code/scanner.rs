@@ -6,12 +6,33 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use super::types::{ScanReport, ScannedCodeFile};
+use super::types::{ScanPartialReason, ScanReport, ScannedCodeFile};
 
 const MAX_FILES: usize = 1_000;
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 const MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_DEPTH: usize = 20;
+
+#[derive(Clone, Copy)]
+struct ScanLimits {
+    max_files: usize,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+    max_depth: usize,
+}
+
+const DEFAULT_LIMITS: ScanLimits = ScanLimits {
+    max_files: MAX_FILES,
+    max_file_bytes: MAX_FILE_BYTES,
+    max_total_bytes: MAX_TOTAL_BYTES,
+    max_depth: MAX_DEPTH,
+};
+
+#[derive(Default)]
+struct ScanControl {
+    #[cfg(test)]
+    fail_read_dir: Option<std::path::PathBuf>,
+}
 
 const SUPPORTED: &[(&str, &str)] = &[
     ("rs", "rust"),
@@ -46,19 +67,44 @@ pub fn supported_language(path: &Path) -> Option<&'static str> {
 }
 
 pub fn scan_project_with_cancel(root: &Path, cancelled: &AtomicBool) -> Result<ScanReport> {
+    scan_project(root, cancelled, DEFAULT_LIMITS, &ScanControl::default())
+}
+
+#[cfg(test)]
+fn scan_project_with_limits(
+    root: &Path,
+    cancelled: &AtomicBool,
+    limits: ScanLimits,
+    fail_read_dir: Option<std::path::PathBuf>,
+) -> Result<ScanReport> {
+    scan_project(root, cancelled, limits, &ScanControl { fail_read_dir })
+}
+
+fn scan_project(
+    root: &Path,
+    cancelled: &AtomicBool,
+    limits: ScanLimits,
+    control: &ScanControl,
+) -> Result<ScanReport> {
     let root = root
         .canonicalize()
         .with_context(|| format!("No se pudo abrir {}", root.display()))?;
     if !root.is_dir() {
         anyhow::bail!("La ruta seleccionada no es una carpeta");
     }
-    let mut report = ScanReport {
-        files: Vec::new(),
-        skipped: 0,
-        errors: Vec::new(),
-    };
+    let mut report = ScanReport::complete();
     let mut total_bytes = 0_u64;
-    scan_directory(&root, &root, 0, &mut total_bytes, &mut report, cancelled)?;
+    scan_directory(
+        &root,
+        &root,
+        0,
+        &mut total_bytes,
+        &mut report,
+        cancelled,
+        limits,
+        control,
+        true,
+    )?;
     report
         .files
         .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
@@ -72,7 +118,12 @@ pub fn scan_single_file(path: &Path) -> Result<ScannedCodeFile> {
     let root = absolute_path
         .parent()
         .context("El archivo no tiene carpeta")?;
-    scanned_file(root, &absolute_path)?.context("Archivo no soportado o excluido")
+    match scanned_file(root, &absolute_path, DEFAULT_LIMITS)? {
+        ScannedFile::Indexable(file) => Ok(file),
+        ScannedFile::PolicyExcluded | ScannedFile::TooLarge => {
+            anyhow::bail!("Archivo no soportado o excluido")
+        }
+    }
 }
 
 fn scan_directory(
@@ -82,24 +133,53 @@ fn scan_directory(
     total_bytes: &mut u64,
     report: &mut ScanReport,
     cancelled: &AtomicBool,
+    limits: ScanLimits,
+    control: &ScanControl,
+    is_root: bool,
 ) -> Result<()> {
     if cancelled.load(Ordering::Relaxed) {
+        report.mark_partial(ScanPartialReason::Cancelled);
         return Ok(());
     }
-    if depth > MAX_DEPTH || report.files.len() >= MAX_FILES || *total_bytes >= MAX_TOTAL_BYTES {
+    if depth > limits.max_depth {
         report.skipped += 1;
+        report.mark_partial(ScanPartialReason::DepthLimit);
         return Ok(());
     }
-    for entry in fs::read_dir(directory)
-        .with_context(|| format!("No se pudo leer {}", directory.display()))?
-    {
+    if report.files.len() >= limits.max_files {
+        report.skipped += 1;
+        report.mark_partial(ScanPartialReason::FileLimit);
+        return Ok(());
+    }
+    if *total_bytes >= limits.max_total_bytes {
+        report.skipped += 1;
+        report.mark_partial(ScanPartialReason::TotalBytesLimit);
+        return Ok(());
+    }
+    let entries = read_directory(directory, control);
+    let entries = match entries {
+        Ok(entries) => entries,
+        Err(error) if is_root => {
+            return Err(error).with_context(|| format!("No se pudo leer {}", directory.display()));
+        }
+        Err(error) => {
+            report
+                .errors
+                .push(format!("{}: {error}", directory.display()));
+            report.mark_partial(ScanPartialReason::TraversalError);
+            return Ok(());
+        }
+    };
+    for entry in entries {
         if cancelled.load(Ordering::Relaxed) {
+            report.mark_partial(ScanPartialReason::Cancelled);
             break;
         }
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
                 report.errors.push(error.to_string());
+                report.mark_partial(ScanPartialReason::TraversalError);
                 continue;
             }
         };
@@ -108,6 +188,7 @@ fn scan_directory(
             Ok(file_type) => file_type,
             Err(error) => {
                 report.errors.push(error.to_string());
+                report.mark_partial(ScanPartialReason::TraversalError);
                 continue;
             }
         };
@@ -120,47 +201,103 @@ fn scan_directory(
                 || generated_browser_directory(root, &path)
             {
                 report.skipped += 1;
-            } else if let Err(error) =
-                scan_directory(root, &path, depth + 1, total_bytes, report, cancelled)
-            {
+            } else if let Err(error) = scan_directory(
+                root,
+                &path,
+                depth + 1,
+                total_bytes,
+                report,
+                cancelled,
+                limits,
+                control,
+                false,
+            ) {
                 report.errors.push(error.to_string());
+                report.mark_partial(ScanPartialReason::TraversalError);
             }
             continue;
         }
-        if report.files.len() >= MAX_FILES || *total_bytes >= MAX_TOTAL_BYTES {
+        if report.files.len() >= limits.max_files {
             report.skipped += 1;
+            report.mark_partial(ScanPartialReason::FileLimit);
             continue;
         }
-        match scanned_file(root, &path) {
-            Ok(Some(file)) if *total_bytes + file.size_bytes <= MAX_TOTAL_BYTES => {
+        if *total_bytes >= limits.max_total_bytes {
+            report.skipped += 1;
+            report.mark_partial(ScanPartialReason::TotalBytesLimit);
+            continue;
+        }
+        match scanned_file(root, &path, limits) {
+            Ok(ScannedFile::Indexable(file))
+                if *total_bytes + file.size_bytes <= limits.max_total_bytes =>
+            {
                 *total_bytes += file.size_bytes;
                 report.files.push(file);
+                if report.files.len() >= limits.max_files {
+                    report.mark_partial(ScanPartialReason::FileLimit);
+                }
+                if *total_bytes >= limits.max_total_bytes {
+                    report.mark_partial(ScanPartialReason::TotalBytesLimit);
+                }
             }
-            Ok(_) => report.skipped += 1,
-            Err(error) => report.errors.push(error.to_string()),
+            Ok(ScannedFile::Indexable(_)) => {
+                report.skipped += 1;
+                report.mark_partial(ScanPartialReason::TotalBytesLimit);
+            }
+            Ok(ScannedFile::TooLarge) => {
+                report.skipped += 1;
+                report.mark_partial(ScanPartialReason::FileSizeLimit);
+            }
+            Ok(ScannedFile::PolicyExcluded) => report.skipped += 1,
+            Err(error) => {
+                report.errors.push(error.to_string());
+                report.mark_partial(ScanPartialReason::TraversalError);
+            }
         }
     }
     Ok(())
 }
 
-fn scanned_file(root: &Path, path: &Path) -> Result<Option<ScannedCodeFile>> {
+fn read_directory(directory: &Path, control: &ScanControl) -> std::io::Result<fs::ReadDir> {
+    #[cfg(not(test))]
+    let _ = control;
+    #[cfg(test)]
+    if control.fail_read_dir.as_deref() == Some(directory) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "error de acceso inyectado",
+        ));
+    }
+    fs::read_dir(directory)
+}
+
+enum ScannedFile {
+    Indexable(ScannedCodeFile),
+    PolicyExcluded,
+    TooLarge,
+}
+
+fn scanned_file(root: &Path, path: &Path, limits: ScanLimits) -> Result<ScannedFile> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     if sensitive_file(name) {
-        return Ok(None);
+        return Ok(ScannedFile::PolicyExcluded);
     }
     let Some(language) = supported_language(path) else {
-        return Ok(None);
+        return Ok(ScannedFile::PolicyExcluded);
     };
     let metadata = fs::metadata(path)?;
-    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
-        return Ok(None);
+    if !metadata.is_file() {
+        return Ok(ScannedFile::PolicyExcluded);
+    }
+    if metadata.len() > limits.max_file_bytes {
+        return Ok(ScannedFile::TooLarge);
     }
     let canonical = path.canonicalize()?;
     if !canonical.starts_with(root) {
-        return Ok(None);
+        return Ok(ScannedFile::PolicyExcluded);
     }
     let relative_path = canonical
         .strip_prefix(root)?
@@ -171,7 +308,7 @@ fn scanned_file(root: &Path, path: &Path) -> Result<Option<ScannedCodeFile>> {
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    Ok(Some(ScannedCodeFile {
+    Ok(ScannedFile::Indexable(ScannedCodeFile {
         absolute_path: canonical,
         relative_path,
         extension,
@@ -312,7 +449,10 @@ mod tests {
             .suffix(".rs")
             .tempfile_in("target")
             .unwrap();
-        assert!(scanned_file(root.path(), outside.path()).unwrap().is_none());
+        assert!(matches!(
+            scanned_file(root.path(), outside.path(), DEFAULT_LIMITS).unwrap(),
+            ScannedFile::PolicyExcluded
+        ));
     }
 
     #[test]
@@ -346,5 +486,84 @@ mod tests {
         let report = scan_project_with_cancel(directory.path(), &cancelled).unwrap();
 
         assert!(report.files.is_empty());
+        assert!(!report.is_complete());
+        assert!(matches!(
+            report.completeness,
+            super::super::types::ScanCompleteness::Partial(ref reasons)
+                if reasons.contains(&ScanPartialReason::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn intentional_exclusions_do_not_make_a_scan_partial() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        fs::create_dir(directory.path().join("target")).unwrap();
+        fs::write(
+            directory.path().join("target/generated.rs"),
+            "fn generated() {}",
+        )
+        .unwrap();
+        fs::write(directory.path().join("secret.env"), "TOKEN=x").unwrap();
+        fs::write(directory.path().join("image.png"), "not code").unwrap();
+
+        let report = scan_project_with_cancel(directory.path(), &AtomicBool::new(false)).unwrap();
+
+        assert!(report.is_complete());
+        assert!(report.files.is_empty());
+    }
+
+    #[test]
+    fn limits_and_access_errors_return_partial_reports() {
+        let directory = tempfile::tempdir_in("target").unwrap();
+        fs::write(directory.path().join("a.rs"), "fn a() {}").unwrap();
+        fs::write(directory.path().join("b.rs"), "fn b() {}").unwrap();
+        let one_file = ScanLimits {
+            max_files: 1,
+            ..DEFAULT_LIMITS
+        };
+        let report =
+            scan_project_with_limits(directory.path(), &AtomicBool::new(false), one_file, None)
+                .unwrap();
+        assert!(!report.is_complete());
+
+        let bytes = ScanLimits {
+            max_total_bytes: 1,
+            ..DEFAULT_LIMITS
+        };
+        let report =
+            scan_project_with_limits(directory.path(), &AtomicBool::new(false), bytes, None)
+                .unwrap();
+        assert!(!report.is_complete());
+
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("deep.rs"), "fn deep() {}").unwrap();
+        let depth = ScanLimits {
+            max_depth: 0,
+            ..DEFAULT_LIMITS
+        };
+        let report =
+            scan_project_with_limits(directory.path(), &AtomicBool::new(false), depth, None)
+                .unwrap();
+        assert!(!report.is_complete());
+
+        let oversized = ScanLimits {
+            max_file_bytes: 1,
+            ..DEFAULT_LIMITS
+        };
+        let report =
+            scan_project_with_limits(directory.path(), &AtomicBool::new(false), oversized, None)
+                .unwrap();
+        assert!(!report.is_complete());
+
+        let report = scan_project_with_limits(
+            directory.path(),
+            &AtomicBool::new(false),
+            DEFAULT_LIMITS,
+            Some(nested.canonicalize().unwrap()),
+        )
+        .unwrap();
+        assert!(!report.is_complete());
+        assert!(report.errors.iter().any(|error| error.contains("acceso")));
     }
 }

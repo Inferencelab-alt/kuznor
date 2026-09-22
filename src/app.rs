@@ -35,7 +35,10 @@ use crate::{
         prompt::{code_history_without_evidence, code_prompt, code_prompt_diagnostic},
         scanner::{scan_project_with_cancel, scan_single_file},
         search::{resolve_file_scope, search_code_scoped, targets_selected_file},
-        types::{CodeFile, CodeProject, PROJECT_CANCELLED, PROJECT_FAILED, PROJECT_READY},
+        types::{
+            CodeFile, CodeProject, PROJECT_FAILED, PROJECT_PARTIAL, PROJECT_READY,
+            ScanPartialReason, ScanReport,
+        },
     },
     config::Settings,
     db::Database,
@@ -1462,12 +1465,11 @@ impl KuznorApp {
                     .to_owned();
                 let project_id = db.upsert_code_project(&name, &root.to_string_lossy())?;
                 indexed_project_id = Some(project_id);
-                let report = if single_file {
-                    crate::code::types::ScanReport {
-                        files: vec![scan_single_file(&path)?],
-                        skipped: 0,
-                        errors: Vec::new(),
-                    }
+                let mut report = if single_file {
+                    let mut report = ScanReport::complete();
+                    report.files.push(scan_single_file(&path)?);
+                    report.mark_partial(ScanPartialReason::SingleFileScope);
+                    report
                 } else {
                     scan_project_with_cancel(&root, &cancelled)?
                 };
@@ -1486,7 +1488,9 @@ impl KuznorApp {
                     .collect::<HashMap<_, _>>();
                 let mut pending = Vec::new();
                 let mut unchanged = 0;
-                for file in &report.files {
+                let mut failed = report.errors.len();
+                let observed_files = report.files.clone();
+                for file in &observed_files {
                     if cancelled.load(Ordering::Relaxed) {
                         anyhow::bail!("Indexacion cancelada");
                     }
@@ -1503,15 +1507,11 @@ impl KuznorApp {
                             }
                         }
                         Err(error) => {
-                            db.upsert_code_file(
-                                project_id,
-                                &file.relative_path,
-                                "",
-                                &file.extension,
-                                &file.language,
-                                file.size_bytes,
-                                Some(&error.to_string()),
-                            )?;
+                            failed += 1;
+                            report
+                                .errors
+                                .push(format!("No se pudo leer {}: {error}", file.relative_path));
+                            report.mark_partial(ScanPartialReason::ReadError);
                         }
                     }
                 }
@@ -1528,7 +1528,6 @@ impl KuznorApp {
                     settings: settings.clone(),
                     cancelled: cancelled.clone(),
                 };
-                let mut failed = report.errors.len();
                 for (position, (file, content, hash)) in pending.into_iter().enumerate() {
                     if cancelled.load(Ordering::Relaxed) {
                         anyhow::bail!("Indexacion cancelada");
@@ -1540,18 +1539,9 @@ impl KuznorApp {
                         report.files.len().saturating_sub(unchanged)
                     )))
                     .ok();
-                    let file_id = db.upsert_code_file(
-                        project_id,
-                        &file.relative_path,
-                        &hash,
-                        &file.extension,
-                        &file.language,
-                        file.size_bytes,
-                        None,
-                    )?;
                     let chunks = chunk_code(
                         project_id,
-                        file_id,
+                        0,
                         &file.relative_path,
                         &file.extension,
                         &file.language,
@@ -1562,36 +1552,36 @@ impl KuznorApp {
                             if cancelled.load(Ordering::Relaxed) {
                                 anyhow::bail!("Indexacion cancelada");
                             }
-                            db.save_code_chunks(file_id, &chunks)?;
-                        }
-                        Err(error) => {
-                            failed += 1;
-                            db.upsert_code_file(
+                            db.replace_code_file_index(
                                 project_id,
                                 &file.relative_path,
                                 &hash,
                                 &file.extension,
                                 &file.language,
                                 file.size_bytes,
-                                Some(&error.to_string()),
+                                &chunks,
                             )?;
+                        }
+                        Err(error) => {
+                            failed += 1;
+                            report.errors.push(format!(
+                                "No se pudo crear embeddings para {}: {error}",
+                                file.relative_path
+                            ));
+                            report.mark_partial(ScanPartialReason::EmbeddingError);
                         }
                     }
                 }
-                if !single_file {
-                    if cancelled.load(Ordering::Relaxed) {
-                        anyhow::bail!("Indexacion cancelada");
-                    }
-                    db.delete_missing_code_files(
-                        project_id,
-                        &report
-                            .files
-                            .iter()
-                            .map(|file| file.relative_path.clone())
-                            .collect::<Vec<_>>(),
-                    )?;
+                if cancelled.load(Ordering::Relaxed) {
+                    anyhow::bail!("Indexacion cancelada");
                 }
-                db.set_code_project_status(project_id, PROJECT_READY)?;
+                let complete = report.is_complete();
+                if complete {
+                    db.delete_missing_code_files(project_id, &report)?;
+                    db.set_code_project_status(project_id, PROJECT_READY)?;
+                } else {
+                    db.set_code_project_status(project_id, PROJECT_PARTIAL)?;
+                }
                 if processes
                     .lock()
                     .map(|manager| manager.owns(ServiceKind::Embedding))
@@ -1608,18 +1598,26 @@ impl KuznorApp {
                 let chunks = db.code_chunks(project_id)?.len();
                 Ok((
                     project_id,
-                    format!(
-                        "Proyecto listo: {} archivos, {} fragmentos, {} sin cambios, {} errores",
-                        report.files.len(),
-                        chunks,
-                        unchanged,
-                        failed
-                    ),
+                    if complete {
+                        format!(
+                            "Proyecto listo: {} archivos, {} fragmentos, {} sin cambios, {} errores",
+                            report.files.len(),
+                            chunks,
+                            unchanged,
+                            failed
+                        )
+                    } else {
+                        format!(
+                            "Indice incompleto: {} archivos observados actualizados; no se eliminaron registros no verificados ({} incidencias).",
+                            report.files.len(),
+                            report.errors.len()
+                        )
+                    },
                 ))
             })();
             if cancelled.load(Ordering::Relaxed) {
                 if let Some(project_id) = indexed_project_id {
-                    let _ = db.set_code_project_status(project_id, PROJECT_CANCELLED);
+                    let _ = db.set_code_project_status(project_id, PROJECT_PARTIAL);
                 }
                 let _ = tx.send(Event::CodeIndexCancelled(indexed_project_id));
             } else {
