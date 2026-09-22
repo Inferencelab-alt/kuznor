@@ -9,7 +9,8 @@ pub enum CodeAction {
     OpenFolder,
     CancelIndexing,
     SelectProject(i64),
-    ReindexProject(i64),
+    RefreshProject(i64),
+    RefreshFile(i64),
     RemoveProject(i64),
     SelectFile(i64),
     QuickPrompt(QuickAction),
@@ -95,11 +96,11 @@ pub fn show_project_panel(
             ui.small(compact_path(&project.root_path, 42))
                 .on_hover_text(&project.root_path);
             ui.horizontal_wrapped(|ui| {
-                if !matches!(project.status.as_str(), "ready" | "listo")
-                    && !indexing
-                    && ui.button("Reindexar proyecto").clicked()
+                if ui
+                    .add_enabled(!indexing, egui::Button::new("Actualizar proyecto"))
+                    .clicked()
                 {
-                    action = Some(CodeAction::ReindexProject(project.id));
+                    action = Some(CodeAction::RefreshProject(project.id));
                 }
                 if ui
                     .add_enabled(!indexing, egui::Button::new("Quitar proyecto"))
@@ -116,6 +117,12 @@ pub fn show_project_panel(
         ui.strong(compact_path(&file.relative_path, 38))
             .on_hover_text(&file.relative_path);
         ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!indexing, egui::Button::new("Actualizar archivo"))
+                .clicked()
+            {
+                action = Some(CodeAction::RefreshFile(file.id));
+            }
             for (label, quick_action) in [
                 ("Explicar", QuickAction::Explain),
                 ("Buscar errores", QuickAction::FindErrors),

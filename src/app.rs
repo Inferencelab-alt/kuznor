@@ -1435,8 +1435,14 @@ impl KuznorApp {
         });
     }
 
-    fn index_code_path(&mut self, path: PathBuf, single_file: bool) {
+    fn index_code_path(
+        &mut self,
+        path: PathBuf,
+        single_file: bool,
+        root_override: Option<PathBuf>,
+    ) {
         if self.code_indexing {
+            self.notice = Some("Ya hay una actualizacion de codigo en curso.".into());
             return;
         }
         self.code_indexing = true;
@@ -1450,12 +1456,13 @@ impl KuznorApp {
         thread::spawn(move || {
             let mut indexed_project_id = None;
             let result = (|| -> Result<(i64, String)> {
-                let root = if single_file {
-                    path.parent()
+                let root = match root_override {
+                    Some(root) => root,
+                    None if single_file => path
+                        .parent()
                         .context("El archivo no tiene carpeta")?
-                        .to_path_buf()
-                } else {
-                    path.clone()
+                        .to_path_buf(),
+                    None => path.clone(),
                 };
                 let root = root.canonicalize()?;
                 let name = root
@@ -1466,8 +1473,15 @@ impl KuznorApp {
                 let project_id = db.upsert_code_project(&name, &root.to_string_lossy())?;
                 indexed_project_id = Some(project_id);
                 let mut report = if single_file {
+                    let mut file = scan_single_file(&path)?;
+                    let absolute_path = path.canonicalize()?;
+                    file.relative_path = absolute_path
+                        .strip_prefix(&root)?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    file.absolute_path = absolute_path;
                     let mut report = ScanReport::complete();
-                    report.files.push(scan_single_file(&path)?);
+                    report.files.push(file);
                     report.mark_partial(ScanPartialReason::SingleFileScope);
                     report
                 } else {
@@ -1651,6 +1665,53 @@ impl KuznorApp {
         }
     }
 
+    fn refresh_selected_code_file(&mut self) {
+        let Some(project_id) = self.active_code_project else {
+            self.notice = Some("No hay un proyecto activo para actualizar.".into());
+            return;
+        };
+        let Some(file_id) = self.selected_code_file else {
+            self.notice = Some("Selecciona un archivo para actualizar.".into());
+            return;
+        };
+        let Some(project) = self
+            .code_projects
+            .iter()
+            .find(|project| project.id == project_id)
+        else {
+            self.notice = Some("El proyecto seleccionado ya no existe.".into());
+            return;
+        };
+        let Some(file) = self.code_files.iter().find(|file| file.id == file_id) else {
+            self.notice =
+                Some("El archivo seleccionado ya no pertenece al proyecto activo.".into());
+            return;
+        };
+        let root = PathBuf::from(&project.root_path);
+        let candidate = root.join(&file.relative_path);
+        let root_canonical = match root.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                self.error(error);
+                return;
+            }
+        };
+        let candidate_canonical = match candidate.canonicalize() {
+            Ok(path) if path.starts_with(&root_canonical) => path,
+            Ok(_) => {
+                self.notice =
+                    Some("El archivo seleccionado esta fuera del proyecto activo.".into());
+                return;
+            }
+            Err(_) => {
+                self.code_status = "Archivo no disponible; indice anterior conservado.".into();
+                self.notice = Some("Archivo no disponible; indice anterior conservado.".into());
+                return;
+            }
+        };
+        self.index_code_path(candidate_canonical, true, Some(root_canonical));
+    }
+
     fn finish_generation_metrics(&mut self) {
         let total_ms = self
             .generation_started
@@ -1828,7 +1889,9 @@ impl KuznorApp {
                     self.code_index_cancel = None;
                     match result {
                         Ok((project_id, status)) => {
-                            self.active_code_project = Some(project_id);
+                            if self.active_code_project.is_none() {
+                                self.active_code_project = Some(project_id);
+                            }
                             self.code_status = status;
                             let _ = self
                                 .db
@@ -2316,12 +2379,12 @@ impl eframe::App for KuznorApp {
                                         )
                                         .pick_file()
                                     {
-                                        self.index_code_path(path, true);
+                                        self.index_code_path(path, true, None);
                                     }
                                 }
                                 OpenFolder => {
                                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                        self.index_code_path(path, false);
+                                        self.index_code_path(path, false, None);
                                     }
                                 }
                                 CancelIndexing => self.cancel_code_indexing(),
@@ -2334,7 +2397,7 @@ impl eframe::App for KuznorApp {
                                     );
                                     let _ = self.reload();
                                 }
-                                ReindexProject(project_id) => {
+                                RefreshProject(project_id) => {
                                     if let Some(project) = self
                                         .code_projects
                                         .iter()
@@ -2343,8 +2406,13 @@ impl eframe::App for KuznorApp {
                                         self.index_code_path(
                                             PathBuf::from(&project.root_path),
                                             false,
+                                            None,
                                         );
                                     }
+                                }
+                                RefreshFile(file_id) => {
+                                    self.selected_code_file = Some(file_id);
+                                    self.refresh_selected_code_file();
                                 }
                                 RemoveProject(project_id) => {
                                     self.pending_remove_code_project = Some(project_id);
